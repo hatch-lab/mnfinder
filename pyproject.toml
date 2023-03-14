@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mnfinder"
+version = "0.1.0"
+authors = [{ name = "Lucian DiPeso", email="ldipeso@uw.edu" }]
+description = "A package for segmenting micronuclei in microscopy images"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "tensorflow",
+  "pandas",
+  "numpy",
+  "scikit-image",
+  "tifffile",
+  "tqdm",
+  "opencv2-contrib-python",
+  "docopt",
+  "stardist",
+  "csbdeep"
+]
+keywords = [
+  "micronucleus",
+  "micronuclei",
+  "U-Net",
+  "segmentation"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/hatch-lab/mnfinder"
