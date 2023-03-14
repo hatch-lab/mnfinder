@@ -14,7 +14,6 @@ import numpy as np
 import cv2
 from tifffile import TiffWriter, TiffFile
 import requests
-import shutil
 import tarfile
 from tqdm import tqdm
 
