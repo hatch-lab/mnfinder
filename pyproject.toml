@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnfinder"
-version = "0.1.0"
+version = "0.1.2"
 authors = [{ name = "Lucian DiPeso", email="ldipeso@uw.edu" }]
 description = "A package for segmenting micronuclei in microscopy images"
 readme = "README.md"
@@ -21,7 +21,7 @@ dependencies = [
   "scikit-image",
   "tifffile",
   "tqdm",
-  "opencv2-contrib-python",
+  "opencv-contrib-python",
   "docopt",
   "stardist",
   "csbdeep"

@@ -3,3 +3,4 @@
 ._*
 models/*/*
 __pycache__
+dist/*
