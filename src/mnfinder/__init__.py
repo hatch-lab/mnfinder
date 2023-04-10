@@ -1,1 +1,1 @@
-name = 'MNUNet'
+from .mnfinder import *
