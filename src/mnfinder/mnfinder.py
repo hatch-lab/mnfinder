@@ -5,6 +5,7 @@ import tensorflow as tf
 import tensorflow.keras.backend as K
 import json
 from skimage.filters import sobel
+from skimage.segmentation import clear_border
 from skimage.measure import regionprops_table, label, find_contours
 from skimage.morphology import disk, binary_opening, opening, binary_erosion
 from skimage.exposure import rescale_intensity
@@ -16,6 +17,7 @@ from tifffile import TiffWriter, TiffFile
 import requests
 import tarfile
 from tqdm import tqdm
+from collections import namedtuple
 
 import matplotlib.pyplot as plt
 
@@ -25,20 +27,19 @@ class MNModel:
 
   @staticmethod
   def get_available_models():
-    available_models = [ 'DiffSobel', 'FocalLoss', 'FocalLoss4Class', 'FocalLoss4Class2', 'FocalLoss4Class3', 'Combined' ]
-
+    available_models = [ 'DiffSobel', 'FocalLoss', 'FocalLoss4Class', 'FocalLoss4Class2', 'FocalLoss4Class3', 'Combined', 'CBLoss' ]
     return available_models
 
   @staticmethod
-  def get_model(model_name):
+  def get_model(model_name='CBLoss'):
     available_models = MNModel.get_available_models()
     if model_name not in available_models:
-      raise ModelNotFound("No such MN model")
+      raise ModelNotFound("No such MN model: %s".format(model_name))
     try:
       model = globals()[model_name]
       return model()
     except:
-      raise ModelNotLoaded("Could not load model")
+      raise ModelNotLoaded("Could not load model: %s".format(model_name))
 
   @staticmethod
   def normalize_image(img, use_csbdeep=False):
@@ -53,6 +54,9 @@ class MNModel:
     self.crop_size = 96
     self.batch_size = 64
     self.name = self.__class__.__name__
+
+    Defaults = namedtuple("defaults", "skip_opening")
+    self.defaults = Defaults(True)
     self._load_model()
 
   def _load_model(self):
@@ -102,7 +106,10 @@ class MNModel:
 
     return nucleus_labels
 
-  def predict_mn(self, img, use_argmax=True, skip_opening=False, **kwargs):
+  def predict_mn(self, img, skip_opening=None, **kwargs):
+    if skip_opening is None:
+      skip_opening = self.defaults.skip_opening
+
     img = self.normalize_dimensions(img)
     if img.shape[0] < self.crop_size or img.shape[1] < self.crop_size:
       raise ValueError("Image is smaller than minimum size of {}x{}".format(self.crop_size, self.crop_size))
@@ -110,23 +117,24 @@ class MNModel:
     coords, dataset, predictions = self._get_mn_predictions(img)
     num_channels = predictions[0].shape[2]
     field_output = np.zeros(( img.shape[0], img.shape[1], num_channels ), dtype=np.float64)
+    field_labels = np.zeros(( img.shape[0], img.shape[1] ), dtype=np.uint8)
+    field_overlaps = np.zeros(( img.shape[0], img.shape[1], 1), dtype=np.uint8)
     for idx, batch in enumerate(dataset):
       left   = coords[idx][0]
       right  = coords[idx][1]
       top    = coords[idx][2]
       bottom = coords[idx][3]
 
-      field_output[top:bottom, left:right] = predictions[idx]
+      field_output[top:bottom, left:right] += predictions[idx]
+      field_overlaps[top:bottom, left:right, 0] += 1
 
-    if not use_argmax:
-      field_prediction = rescale_intensity(field_output, out_range=np.uint8)
-      field_prediction = ((field_prediction[...,0] < self.bg_thresh) & (field_prediction[...,2] > self.fg_thresh))
-    else:
-      field_prediction = (np.argmax(field_output, axis=-1) == 2).astype(np.uint8)
+    field_output /= field_overlaps
+    field_labels = np.argmax(field_output, axis=-1).astype(np.uint8)
+    field_labels = (field_labels == 2).astype(np.uint8)
 
     if not skip_opening:
-      field_prediction = binary_opening(field_prediction, footprint=disk(1)).astype(np.uint8)
-    field_labels = label(field_prediction, connectivity=1)
+      field_labels = binary_opening(field_labels, footprint=disk(1)).astype(np.uint8)
+    field_labels = label(field_labels, connectivity=1)
 
     return field_labels, field_output
 
@@ -367,7 +375,7 @@ class MNModel:
 
     crops = []
 
-    oversample_px = self.crop_size//4
+    oversample_px = self.crop_size//2
     slide_px = self.crop_size-oversample_px
 
     this_y = 0
@@ -405,7 +413,8 @@ class Combined(MNModel):
       MNModel.get_model("FocalLoss"),
       MNModel.get_model("FocalLoss4Class"),
       MNModel.get_model("FocalLoss4Class2"),
-      MNModel.get_model("FocalLoss4Class3")
+      MNModel.get_model("FocalLoss4Class3"),
+      MNModel.get_model("CBLoss")
     ]
 
     self.model_url = None
@@ -413,58 +422,79 @@ class Combined(MNModel):
   def _load_model(self):
     return True
 
-  def predict_mn(self, img, use_argmax=True, skip_opening=False, threshold=0.1, **kwargs):
-    combined = np.zeros_like(img[...,0])
-    combined_raw = []
+  def predict_mn(self, img, skip_opening=False, threshold=0.1, **kwargs):
+    field_output = np.zeros(( img.shape[0], img.shape[1], 4 ), dtype=np.float64)
     for model in self.models:
-      mn_labels, mn_raw = model.predict_mn(img, use_argmax, skip_opening, **kwargs)
-      combined[(mn_labels > 0)] += 1
-      combined_raw.append(mn_raw)
+      mn_labels, mn_raw = model.predict_mn(img, skip_opening, **kwargs)
+      field_output[...,0:4] += mn_raw[...,0:4]
 
-    combined[(combined > (threshold*len(self.models)))] = 1
-    combined_labels = label(combined, connectivity=1)
+    field_output /= len(self.models)
+    field_labels = np.argmax(field_output, axis=-1).astype(np.uint8)
+    field_labels = (field_labels == 2).astype(np.uint8)
 
-    combined_raw = np.mean(combined_raw, axis=0)
+    field_labels = label(field_labels, connectivity=1)
 
-    return combined_labels, combined_raw
+    return field_labels, field_output
 
 class FocalLoss(MNModel):
   def __init__(self):
-    self.bg_thresh = 143
-    self.fg_thresh = 130
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss.tar.gz'
 
     super().__init__()
 
 class FocalLoss4Class(MNModel):
   def __init__(self):
-    self.bg_thresh = 149
-    self.fg_thresh = 143
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class.tar.gz'
 
     super().__init__()
 
 class FocalLoss4Class2(MNModel):
   def __init__(self):
-    self.bg_thresh = 251
-    self.fg_thresh = 226
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class2.tar.gz'
 
     super().__init__()
 
 class FocalLoss4Class3(MNModel):
   def __init__(self):
-    self.bg_thresh = 233
-    self.fg_thresh = 229
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
 
     super().__init__()
 
+class CBLoss(MNModel):
+  def __init__(self):
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/CBLoss.tar.gz'
+
+    super().__init__()
+
+    self.crop_size = 128
+    Defaults = namedtuple("defaults", "skip_opening")
+    self.defaults = Defaults(False)
+
+  def _get_custom_metrics(self):
+    metrics = super()._get_custom_metrics()
+
+    def dice_coef(y_true, y_pred, smooth=1):
+      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=5)[...,2:4]), dtype=tf.float32)
+      y_pred_f = K.flatten(tf.cast(y_pred[...,2:4], dtype=tf.float32))
+      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
+      denom = K.sum(2. * y_true_f + y_pred_f, axis=-1)
+      return K.mean((2. * intersection / (denom + smooth)))
+
+    def mean_iou(y_true, y_pred, smooth=1):
+      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=5)[...,2:4]), dtype=tf.float32)
+      y_pred_f = K.flatten(tf.cast(y_pred[...,2:4], dtype=tf.float32))
+      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
+      union = K.sum(y_true_f + y_pred_f, axis=-1)-intersection
+      return (intersection + smooth)/(union + smooth)
+
+    metrics['dice_coef'] = dice_coef
+    metrics['mean_iou'] = mean_iou
+
+    return metrics
+
 
 class DiffSobel(MNModel):
   def __init__(self):
-    self.bg_thresh = 109
-    self.fg_thresh = 122
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DiffSobel.tar.gz'
 
     super().__init__()
@@ -494,11 +524,11 @@ class DiffSobel(MNModel):
 
     return coords, dataset, predictions
 
-  def predict_mn(self, img, use_argmax=False, skip_opening=False, **kwargs):
+  def predict_mn(self, img, skip_opening=False, **kwargs):
     if len(img.shape) <= 2 or img.shape[2] < 2:
       raise ValueError("DiffSobel requires an image with 2 channels")
 
-    return super().predict_mn(img, use_argmax=use_argmax, skip_opening=skip_opening)
+    return super().predict_mn(img, skip_opening=skip_opening)
 
 class IncorrectDimensions(Exception):
   "Images must be (x,y,c) or (x,y)"
