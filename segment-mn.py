@@ -15,7 +15,7 @@ Options:
     -h --help  Show this screen
     --version  Show version
     -o FILE --output=FILE  Where to output the mask
-    --model=<name>  The name of the MN classifier to use [default: Combined]
+    --model=<name>  The name of the MN classifier to use [default: CBLoss]
     --dna-channel=<int>  Which channel is the DNA/chromatin stain [default: 1]
     --nls-channel=<int>  Which channel is the NLS marker [default: 2]
     --mn-intensity-channel=<int>  Which channel to use for determining intact vs ruptured MN [default: 2]
