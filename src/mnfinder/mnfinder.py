@@ -34,11 +34,7 @@ class MNModel:
       'FocalLoss4Class2', 
       'FocalLoss4Class3', 
       'Combined', 
-      'CBLoss', 
-      'DeepUNet',
-      'DeepUNet3Class',
-      'DeepUNetNew',
-      'DeepUNet3ClassNew'
+      'CBLoss'
     ]
     return available_models
 
@@ -543,25 +539,6 @@ class DeepUNet(MNModel):
     metrics['mean_iou_with_nuc'] = mean_iou
 
     return metrics
-
-
-class DeepUNetNew(DeepUNet):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DeepUNet.tar.gz'
-
-    super().__init__()
-
-class DeepUNet3Class(DeepUNet):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DeepUNet.tar.gz'
-
-    super().__init__()
-
-class DeepUNet3ClassNew(DeepUNet):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DeepUNet.tar.gz'
-
-    super().__init__()
 
 class DiffSobel(MNModel):
   def __init__(self):
