@@ -23,23 +23,35 @@ import matplotlib.pyplot as plt
 
 class MNModel:
 
-  models_root = (Path(__file__) / "../models").resolve()
+  models_root = (Path(__file__) / "../../../models").resolve()
 
   @staticmethod
   def get_available_models():
-    available_models = [ 'DiffSobel', 'FocalLoss', 'FocalLoss4Class', 'FocalLoss4Class2', 'FocalLoss4Class3', 'Combined', 'CBLoss' ]
+    available_models = [ 
+      'DiffSobel', 
+      'FocalLoss', 
+      'FocalLoss4Class', 
+      'FocalLoss4Class2', 
+      'FocalLoss4Class3', 
+      'Combined', 
+      'CBLoss', 
+      'DeepUNet',
+      'DeepUNet3Class',
+      'DeepUNetNew',
+      'DeepUNet3ClassNew'
+    ]
     return available_models
 
   @staticmethod
   def get_model(model_name='CBLoss'):
     available_models = MNModel.get_available_models()
     if model_name not in available_models:
-      raise ModelNotFound("No such MN model: %s".format(model_name))
+      raise ModelNotFound("No such MN model: {}".format(model_name))
     try:
       model = globals()[model_name]
       return model()
     except:
-      raise ModelNotLoaded("Could not load model: %s".format(model_name))
+      raise ModelNotLoaded("Could not load model: {}".format(model_name))
 
   @staticmethod
   def normalize_image(img, use_csbdeep=False):
@@ -492,6 +504,64 @@ class CBLoss(MNModel):
 
     return metrics
 
+class DeepUNet(MNModel):
+  def __init__(self):
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DeepUNet.tar.gz'
+
+    super().__init__()
+
+    self.crop_size = 128
+    Defaults = namedtuple("defaults", "skip_opening")
+    self.defaults = Defaults(True)
+
+  def _get_custom_metrics(self):
+    metrics = super()._get_custom_metrics()
+
+    def dice_coef(y_true, y_pred, smooth=1):
+      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=4)[...,2]), dtype=tf.float32)
+      y_pred_f = K.flatten(tf.cast(y_pred[...,2], dtype=tf.float32))
+      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
+      denom = K.sum(2. * y_true_f + y_pred_f, axis=-1)
+      return K.mean((2. * intersection / (denom + smooth)))
+
+    def mean_iou(y_true, y_pred, smooth=1):
+      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=4)[...,2]), dtype=tf.float32)
+      y_pred_f = K.flatten(tf.cast(y_pred[...,2], dtype=tf.float32))
+      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
+      union = K.sum(y_true_f + y_pred_f, axis=-1)-intersection
+      return (intersection + smooth)/(union + smooth)
+
+    def mean_iou_with_nuc(y_true, y_pred, smooth=1):
+      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=4)[...,1:3]), dtype=tf.float32)
+      y_pred_f = K.flatten(tf.cast(y_pred[...,1:3], dtype=tf.float32))
+      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
+      union = K.sum(y_true_f + y_pred_f, axis=-1)-intersection
+      return (intersection + smooth)/(union + smooth)
+
+    metrics['dice_coef'] = dice_coef
+    metrics['mean_iou'] = mean_iou
+    metrics['mean_iou_with_nuc'] = mean_iou
+
+    return metrics
+
+
+class DeepUNetNew(DeepUNet):
+  def __init__(self):
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DeepUNet.tar.gz'
+
+    super().__init__()
+
+class DeepUNet3Class(DeepUNet):
+  def __init__(self):
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DeepUNet.tar.gz'
+
+    super().__init__()
+
+class DeepUNet3ClassNew(DeepUNet):
+  def __init__(self):
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DeepUNet.tar.gz'
+
+    super().__init__()
 
 class DiffSobel(MNModel):
   def __init__(self):
