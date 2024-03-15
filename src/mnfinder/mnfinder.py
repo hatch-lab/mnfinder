@@ -70,6 +70,8 @@ class MNModel:
         Whether to return the convex hulls of MN segments
       use_argmax : bool
         Whether to assign pixel classes by argmax, or by thresholds
+    model_url : str
+      The URL for downloading model weights
 
 
     Static methods
@@ -919,114 +921,23 @@ class MNModel:
     return MNModel.models_root / self.name
 
 
-class FocalLoss(MNModel):
+class LaplaceDeconstruction(MNModel):
+  """
+  Laplace pyramids can separate an image into different frequencies, with each frequency 
+  corresponding to a given level of informational detail.
+
+  MN neural nets seem to rely heavily on examining the edges of nuclei to find associated MN.
+  By breaking an image into a Laplacian pyramid and then recombining only the top 2 levels
+  of detail, this removes information about the center of nuclei.
+
+  This is an Attention UNet trained on these deconstructed images
+  """
   def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss.tar.gz'
-
-    super().__init__()
-
-class FocalLoss4Class(MNModel):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class.tar.gz'
-
-    super().__init__()
-
-class FocalLoss4Class2(MNModel):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class2.tar.gz'
-
-    super().__init__()
-
-class FocalLoss4Class3(MNModel):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
-
-    super().__init__()
-
-class CBLoss(MNModel):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/CBLoss.tar.gz'
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/LaplaceDeconstruction.tar.gz'
 
     super().__init__()
 
     self.crop_size = 128
-
-  def _get_custom_metrics(self):
-    metrics = super()._get_custom_metrics()
-
-    def dice_coef(y_true, y_pred, smooth=1):
-      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=5)[...,2:4]), dtype=tf.float32)
-      y_pred_f = K.flatten(tf.cast(y_pred[...,2:4], dtype=tf.float32))
-      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
-      denom = K.sum(2. * y_true_f + y_pred_f, axis=-1)
-      return K.mean((2. * intersection / (denom + smooth)))
-
-    def mean_iou(y_true, y_pred, smooth=1):
-      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=5)[...,2:4]), dtype=tf.float32)
-      y_pred_f = K.flatten(tf.cast(y_pred[...,2:4], dtype=tf.float32))
-      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
-      union = K.sum(y_true_f + y_pred_f, axis=-1)-intersection
-      return (intersection + smooth)/(union + smooth)
-    
-    def mean_iou_with_nuc(y_true, y_pred, smooth=1):
-      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=4)[...,1:3]), dtype=tf.float32)
-      y_pred_f = K.flatten(tf.cast(y_pred[...,1:3], dtype=tf.float32))
-      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
-      union = K.sum(y_true_f + y_pred_f, axis=-1)-intersection
-      return (intersection + smooth)/(union + smooth)
-
-    metrics['dice_coef'] = dice_coef
-    metrics['mean_iou'] = mean_iou
-    metrics['mean_iou_with_nuc'] = mean_iou_with_nuc
-
-    return metrics
-
-class DeepUNet(MNModel):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DeepUNet.tar.gz'
-
-    super().__init__()
-
-    self.crop_size = 128
-    self.defaults.skip_opening = True
-    self.defaults.privilege_nuclei = True
-
-  def _get_custom_metrics(self):
-    metrics = super()._get_custom_metrics()
-
-    def dice_coef(y_true, y_pred, smooth=1):
-      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=4)[...,2]), dtype=tf.float32)
-      y_pred_f = K.flatten(tf.cast(y_pred[...,2], dtype=tf.float32))
-      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
-      denom = K.sum(2. * y_true_f + y_pred_f, axis=-1)
-      return K.mean((2. * intersection / (denom + smooth)))
-
-    def mean_iou(y_true, y_pred, smooth=1):
-      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=4)[...,2]), dtype=tf.float32)
-      y_pred_f = K.flatten(tf.cast(y_pred[...,2], dtype=tf.float32))
-      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
-      union = K.sum(y_true_f + y_pred_f, axis=-1)-intersection
-      return (intersection + smooth)/(union + smooth)
-
-    def mean_iou_with_nuc(y_true, y_pred, smooth=1):
-      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=4)[...,1:3]), dtype=tf.float32)
-      y_pred_f = K.flatten(tf.cast(y_pred[...,1:3], dtype=tf.float32))
-      intersection = K.sum(y_true_f * y_pred_f, axis=-1)
-      union = K.sum(y_true_f + y_pred_f, axis=-1)-intersection
-      return (intersection + smooth)/(union + smooth)
-
-    metrics['dice_coef'] = dice_coef
-    metrics['mean_iou'] = mean_iou
-    metrics['mean_iou_with_nuc'] = mean_iou
-
-    return metrics
-
-class LaplaceDeconstruction(CBLoss):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
-
-    super().__init__()
-
     self.bg_max = 0.5
     self.fg_min = 0.1
    
@@ -1034,6 +945,23 @@ class LaplaceDeconstruction(CBLoss):
     self.defaults.opening_footprint = 2
 
   def _get_mn_predictions(self, img):
+    """
+    Crops an image and generates a list of neural net predictions of each
+
+    Parameters
+    --------
+    img : np.array
+      The image to predict
+    
+    Returns
+    --------
+    list
+      The coordinates of each crop in the original image in (r,c) format
+    tf.Dataset
+      The batched TensorFlow dataset used as input
+    list
+      The predictions
+    """
     tensors = []
     coords = []
     num_channels = img.shape[2]
@@ -1042,7 +970,7 @@ class LaplaceDeconstruction(CBLoss):
     sobel_idx = num_channels
 
     for crop in crops:
-      lp, sp = self._get_laplacian_pyramid(crop['image'][...,0], 2)
+      lp = self._get_laplacian_pyramid(crop['image'][...,0], 2)
       new_img = lp[1]
       new_img = cv2.pyrUp(new_img, lp[0].shape[1::-1])
       new_img += lp[0]
@@ -1062,6 +990,24 @@ class LaplaceDeconstruction(CBLoss):
     return coords, dataset, predictions
 
   def _get_needed_padding(self, img, num_levels):
+    """
+    Determine if a crop needs additional padding to generate 
+    a Laplacian pyramid of a given depth
+
+    Parameters
+    --------
+    img : np.array
+      The image to predict
+    num_levels : int
+      The depth of the pyramid
+    
+    Returns
+    --------
+    int
+      The needed x padding
+    int
+      The needed y padding
+    """
     divisor = 2**num_levels
 
     x_remainder = img.shape[1]%divisor
@@ -1073,6 +1019,22 @@ class LaplaceDeconstruction(CBLoss):
     return x_padding, y_padding
 
   def _pad_img(self, img, num_levels):
+    """
+    Pads a crop so that a Laplacian pyramid of a given depth
+    can be made
+
+    Parameters
+    --------
+    img : np.array
+      The image to predict
+    num_levels : int
+      The depth of the pyramid
+    
+    Returns
+    --------
+    np.array
+      The padded image
+    """
     x_padding, y_padding = self._get_needed_padding(img, num_levels)
     if len(img.shape) == 2:
       new_img = np.zeros(( img.shape[0]+y_padding, img.shape[1]+x_padding), dtype=img.dtype)
@@ -1083,117 +1045,76 @@ class LaplaceDeconstruction(CBLoss):
     new_img[0:img.shape[0], 0:img.shape[1]] = img
     return new_img
 
-  def _get_gaussian_pyramid(self, img, num_levels):
-    img = self._pad_img(img, num_levels)
-    gp = [img]
-    for i in range(1, num_levels):
-        gp.append(cv2.pyrDown(gp[i-1]))
-    return gp
-
   def _get_laplacian_pyramid(self, img, num_levels):
+    """
+    Builds a Laplacian pyramid of a given depth
+
+    Parameters
+    --------
+    img : np.array
+      The image to predict
+    num_levels : int
+      The depth of the pyramid
+    
+    Returns
+    --------
+    list
+      List of levels
+    """
     img = self._pad_img(img, num_levels)
     lp = []
-    sp = []
     for i in range(num_levels-1):
       next_img = cv2.pyrDown(img)
       diff = img - cv2.pyrUp(next_img, img.shape[1::-1])
       lp.append(diff)
-      sp.append(sobel(diff))
       img = next_img
     lp.append(img)
-    sp.append(rescale_intensity(sobel(img), out_range=(0,1)))
 
-    return lp, sp
+    return lp
 
-class LaplaceDeconstruction2(LaplaceDeconstruction):
+class Attention(MNModel):
+  """
+  A basic U-Net with additional attention modules in the decoder.
+
+  Trained on single-channel images + Sobel
+  """
   def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention.tar.gz'
 
     super().__init__()
 
-    self.bg_max = 0.5
-    self.fg_min = 0.1
-   
-    self.defaults.use_argmax = False
-    self.defaults.opening_footprint = 2
-
-  def _get_mn_predictions(self, img):
-    tensors = []
-    coords = []
-    num_channels = img.shape[2]
-    crops = self._get_image_crops(img)
-
-    sobel_idx = num_channels
-
-    for crop in crops:
-      lp, sp = self._get_laplacian_pyramid(crop['image'][...,0], 2)
-      new_img = lp[1]
-      new_img = cv2.pyrUp(new_img, lp[0].shape[1::-1])
-      new_img += lp[0]
-      new_img += sobel(new_img)
-
-      new_img = rescale_intensity(new_img, out_range=(0,1))
-
-      tensors.append(tf.convert_to_tensor(
-        np.expand_dims(new_img, axis=-1)
-      ))
-      coords.append(crop['coords'])
-
-    dataset = tf.data.Dataset.from_tensor_slices(tensors)
-    dataset_batchs = dataset.batch(self.batch_size)
-    predictions = self.trained_model.predict(dataset_batchs, verbose = 0)
-
-    return coords, dataset, predictions
-
-class Attention(CBLoss):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
-
-    super().__init__()
+    self.crop_size = 128
 
     self.defaults.use_argmax = False
 
     self.bg_max = 0.59
     self.fg_min = 0.24
 
-class Attention96(CBLoss):
+class Attention96(MNModel):
+  """
+  A basic U-Net with additional attention modules in the decoder, but using a 96x96 crop size.
+
+  Trained on single-channel images + Sobel
+  """
   def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention96.tar.gz'
 
     super().__init__()
-    self.crop_size = 96
     self.defaults.use_argmax = True
 
     self.bg_max = 0.59
     self.fg_min = 0.24
 
-class MSAttention2(CBLoss):
+class MSAttention(Attention):
+  """
+  An attention unit with an additional multi-scale modules on the front of each down block in the encoder.
+
+  This performs convolutions at different resolutions and then runs MaxPooling on the concatenated results.
+
+  Trained on single-channel images.
+  """
   def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
-
-    super().__init__()
-
-    self.defaults.use_argmax = False
-
-    self.bg_max = 0.6
-    self.fg_min = 0.3
-    self.defaults.opening_footprint = 1
-
-class MSAttention296(CBLoss):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
-
-    super().__init__()
-    self.crop_size = 96
-    self.defaults.use_argmax = True
-
-    self.bg_max = 0.6
-    self.fg_min = 0.3
-    self.defaults.opening_footprint = 1
-
-class MSAttention(CBLoss):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/MSAttention.tar.gz'
 
     super().__init__()
 
@@ -1223,21 +1144,14 @@ class MSAttention(CBLoss):
 
     return coords, dataset, predictions
 
-class MSAttentionD5(MSAttention):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
-
-    super().__init__()
-
-    self.defaults.use_argmax = False
-
-    self.bg_max = 0.5
-    self.fg_min = 0.3
-    self.defaults.opening_footprint = 1
-
 class MSAttention96(MSAttention):
+  """
+  A multi-scale attention UNet, but with 96x96 crop sizes.
+
+  Trained on single-channel images.
+  """
   def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/MSAttention96.tar.gz'
 
     super().__init__()
 
@@ -1248,60 +1162,20 @@ class MSAttention96(MSAttention):
     self.fg_min = 0.25
     self.defaults.opening_footprint = 1
 
-class MSAttentionRDense(MSAttention):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
-
-    super().__init__()
-
-    self.defaults.use_argmax = False
-
-    self.bg_max = 0.6
-    self.fg_min = 0.2
-
-class MSARDE(MSAttention):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
-
-    super().__init__()
-
-    self.defaults.use_argmax = False
-
-    self.bg_max = 0.6
-    self.fg_min = 0.3
-
-class MSARDE2(CBLoss):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
-
-    super().__init__()
-
-    self.defaults.use_argmax = True
-    self.defaults.privilege_nuclei = True
-
-    self.bg_max = 0.6
-    self.fg_min = 0.3
-
-
-class MSAttentionRDense96(MSAttention96):
-  def __init__(self):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/FocalLoss4Class3.tar.gz'
-
-    super().__init__()
-
-    self.defaults.use_argmax = False
-
-    self.bg_max = 0.6
-    self.fg_min = 0.35
-
-class SimpleCombined(CBLoss):
+class SimpleCombined(MNModel):
+  """
+  A simple ensembling method where MN masks from multiple models
+  are combined together as a simple union, but with some size filtering
+  """
   def __init__(self):
     super().__init__()
 
+    self.crop_size = 128
+
+    # The base model will be used to generate
     self.base_model = MNModel.get_model("Attention")
     self.supplementary_models = [
       MNModel.get_model("MSAttention")
-      # MNModel.get_model("MSARDE2")
     ]
 
     self.model_url = None
@@ -1310,7 +1184,38 @@ class SimpleCombined(CBLoss):
   def _load_model(self):
     return True
 
-  def predict_mn(self, img, skip_opening=None, expand_masks=None, use_argmax=None, **kwargs):
+  def predict(self, img, skip_opening=None, expand_masks=None, use_argmax=None, area_thresh=250, **kwargs):
+    """
+    Generates MN and nuclear segments
+
+    Parameters
+    --------
+    img : np.array
+      The image to predict
+    skip_opening : bool|None
+      Whether to skip running binary opening on MN predictions. If None, defaults
+      to this model's value in self.defaults.skip_opening
+    expand_masks : bool|None
+      Whether to expand MN segments to their convex hull. If None, defaults
+      to self.defaults.expand_masks
+    use_argmax : bool|None
+      If true, pixel classes are assigned to whichever class has the highest
+      probability. If false, MN are assigned by self.bg_max and self.fg_min 
+      thresholds 
+    area_thresh : int|False
+      Larger MN that are separate from the nucleus tend to be called as nuclei.
+      Any nucleus segments < area_thresh will be converted to MN. If False, this
+      will not be done
+    
+    Returns
+    --------
+    np.array
+      The nucleus labels
+    np.array
+      The MN labels
+    np.array
+      The raw output form the neural net
+    """
     if skip_opening is None:
       skip_opening = self.defaults.skip_opening
 
@@ -1320,65 +1225,39 @@ class SimpleCombined(CBLoss):
     if use_argmax is None:
       use_argmax = self.defaults.use_argmax
 
-    all_mn_labels, all_raw = self.base_model.predict_mn(img)
-    all_mn_labels = (all_mn_labels != 0).astype(np.uint16)
+    nucleus_labels, base_mn_labels, field_output = self.base_model.predict(img, skip_opening, expand_masks, use_argmax, area_thresh)
+
+    base_mn_labels = (base_mn_labels != 0).astype(np.uint16)
     for idx,model in enumerate(self.supplementary_models):
-      mn_labels, mn_raw = model.predict_mn(img, **kwargs)
+      _, mn_labels, mn_raw = model.predict(img, skip_opening, expand_masks, use_argmax, area_thresh)
       mn_labels = opening(mn_labels, footprint=disk(2))
       mn_info = pd.DataFrame(regionprops_table(mn_labels, properties=('label', 'solidity', 'area')))
       keep_labels = mn_info['label'].loc[(mn_info['area'] < 250)]
-      all_mn_labels[np.isin(mn_labels, keep_labels)] = 1
-      all_raw += mn_raw
+      base_mn_labels[np.isin(mn_labels, keep_labels)] = 1
+      field_output += mn_raw
 
-    all_mn_labels = label(all_mn_labels, connectivity=1)
+    nucleus_labels[base_mn_labels != 0] = 0
+    base_mn_labels = label(base_mn_labels, connectivity=1)
     
-    return all_mn_labels, all_raw
+    return nucleus_labels, base_mn_labels, field_output
   
-class WideNet(LaplaceDeconstruction):
+
+class Combined(MNModel):
+  """
+  An ensemble predictor
+
+  Trained on the output of the Attention and MSAttention models
+  """
   def __init__(self):
+    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Combined.tar.gz'
+
     super().__init__()
 
-    # self.model_url = None
-    self.defaults.use_argmax = False
-    self.defaults.privilege_nuclei = True
-    self.bg_max = 0.5
-    self.fg_min = 0.2
-
-  def _get_mn_predictions(self, img):
-    tensors = []
-    coords = []
-    crops = self._get_image_crops(img)
-
-    for crop in crops:
-      mic_img = adjust_gamma(rescale_intensity(crop['image'][...,0], out_range=(0,1)), 0.6)
-      lp, sp = self._get_laplacian_pyramid(mic_img, 2)
-      laplace_img = lp[1]
-      laplace_img = cv2.pyrUp(laplace_img, lp[0].shape[1::-1])
-      laplace_img += lp[0]
-      laplace_img += sobel(laplace_img)
-
-      laplace_img = rescale_intensity(laplace_img, out_range=(0,1))
-
-      tensors.append(tf.convert_to_tensor(
-        np.stack([ mic_img, laplace_img ], axis=-1)
-      ))
-      coords.append(crop['coords'])
-
-    dataset = tf.data.Dataset.from_tensor_slices(tensors)
-    dataset_batchs = dataset.batch(self.batch_size)
-    predictions = self.trained_model.predict(dataset_batchs, verbose = 0)
-
-    return coords, dataset, predictions
-
-class Combined(CBLoss):
-  def __init__(self):
-    super().__init__()
+    self.crop_size = 128
 
     self.models = [
-      MNModel.get_model("CBLoss"),
       MNModel.get_model("Attention"),
-      MNModel.get_model("LaplaceDeconstruction")
-      # MNModel.get_model("LaplaceDeconstructionHarris")
+      MNModel.get_model("MSAttention")
     ]
 
     # self.model_url = None
@@ -1390,6 +1269,26 @@ class Combined(CBLoss):
   #   return True
 
   def _get_mn_predictions(self, img):
+    """
+    Crops an image and generates a list of neural net predictions of each
+
+    First gets the raw outputs of the models stored in self.models, then uses
+    that as input to the model.
+
+    Parameters
+    --------
+    img : np.array
+      The image to predict
+    
+    Returns
+    --------
+    list
+      The coordinates of each crop in the original image in (r,c) format
+    tf.Dataset
+      The batched TensorFlow dataset used as input
+    list
+      The predictions
+    """
     tensors = []
     coords = []
     model_predictions = []
@@ -1419,25 +1318,6 @@ class Combined(CBLoss):
       expanded[idx][...,2] = prediction[...,1]
 
     return coords, dataset, expanded
-
-class CombinedNoCBLoss(Combined):
-  def __init__(self):
-    super().__init__()
-
-    self.crop_size = 96
-
-    self.models = [
-      # MNModel.get_model("CBLoss"),
-      MNModel.get_model("Attention96"),
-      MNModel.get_model("MSAttention296"),
-      # MNModel.get_model("LaplaceDeconstruction")
-      # MNModel.get_model("LaplaceDeconstructionHarris")
-    ]
-
-    # self.model_url = None
-    self.defaults.use_argmax = False
-    self.bg_max = 0.5
-    self.fg_min = 0.35
 
 class IncorrectDimensions(Exception):
   "Images must be (x,y,c) or (x,y)"
