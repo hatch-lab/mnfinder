@@ -12,13 +12,14 @@ from skimage.segmentation import clear_border
 import pandas as pd
 import numpy as np
 import cv2
-from tifffile import TiffWriter, TiffFile
+from tifffile import TiffWriter, TiffFile, tifffile
 import requests
 import tarfile
 from tqdm import tqdm
 import math
 
 import matplotlib.pyplot as plt
+from models import AttentionUNet, MSAttentionUNet
 
 class MNModelDefaults:
   """
@@ -40,62 +41,63 @@ class MNModelDefaults:
 
 class MNModel:
   """
-    Base class for a MN segmenter.
+  Base class for a MN segmenter.
 
-    Attributes
-    ----------
-    models_root : Path
-      Where model files are stored
-    crop_size : int
-      The input width and height of the model
-    oversample_size : int
-      The amount of overlap between crops when scanning across an image
-    batch_size : int
-      Batch size for running predictions
-    name : str
-      The name of this model
-    bg_max : float
-      If not using argmax to decide pixel classes, the maximum threshold
-      a pixel can have for class 0 and still be considered a MN (class 2)
-    fg_min : float
-      If not using argmax to decide pixel classes, the minimum threshold
-      a pixel can have for class 2 and still be considered a MN
-    defaults : MNModelDefaults
-      Stores defaults for prediction parameters. Typically includes:
-      skip_opening : bool
-        Whether to skip performing binary opening on predictions
-      opening_radius : int
-        The radius of a disk used as the footprint for binary_opening
-      expand_masks : bool
-        Whether to return the convex hulls of MN segments
-      use_argmax : bool
-        Whether to assign pixel classes by argmax, or by thresholds
-    model_url : str
-      The URL for downloading model weights
+  Attributes
+  ----------
+  models_root : Path
+    Where model files are stored
+  crop_size : int
+    The input width and height of the model
+  oversample_size : int
+    The amount of overlap between crops when scanning across an image
+  batch_size : int
+    Batch size for running predictions
+  name : str
+    The name of this model
+  bg_max : float
+    If not using argmax to decide pixel classes, the maximum threshold
+    a pixel can have for class 0 and still be considered a MN (class 2)
+  fg_min : float
+    If not using argmax to decide pixel classes, the minimum threshold
+    a pixel can have for class 2 and still be considered a MN
+  defaults : MNModelDefaults
+    Stores defaults for prediction parameters. Typically includes:
+    skip_opening : bool
+      Whether to skip performing binary opening on predictions
+    opening_radius : int
+      The radius of a disk used as the footprint for binary_opening
+    expand_masks : bool
+      Whether to return the convex hulls of MN segments
+    use_argmax : bool
+      Whether to assign pixel classes by argmax, or by thresholds
+  model_url : str
+    The URL for downloading model weights
+
+  Static methods
+  --------
+  get_available_models()
+    Return the names of all available predictors
+  is_model_available(model_name=str)
+    Whether the given model name exists
+  get_model(model_name=str)
+    Returns an instance of the predictor with the given name
+  normalize_image(img=np.array)
+    Normalizes the intensity and data type of an image
+  normalize_dimensions(img=np.array)
+    Normalizes the image shape
+  eval_mn_prediction(mn_true_masks=np.array, mn_labels=np.array)
+    Generates metrics on how well a prediction is performing given
+    a ground-truth mask
 
 
-    Static methods
-    --------
-    get_available_models()
-      Return the names of all available predictors
-    is_model_available(model_name=str)
-      Whether the given model name exists
-    get_model(model_name=str)
-      Returns an instance of the predictor with the given name
-    normalize_image(img=np.array)
-      Normalizes the intensity and data type of an image
-    normalize_dimensions(img=np.array)
-      Normalizes the image shape
-    eval_mn_prediction(mn_true_masks=np.array, mn_labels=np.array)
-      Generates metrics on how well a prediction is performing given
-      a ground-truth mask
-
-
-    Public methods
-    --------
-    predict(img=np.array, skip_opening=bool|None, area_thresh=int, **kwargs)
-      Generates masks of nuclei and micronuclei for a given image
-    """
+  Public methods
+  --------
+  predict(img=np.array, skip_opening=bool|None, area_thresh=int, **kwargs)
+    Generates masks of nuclei and micronuclei for a given image
+  train(train_root=Path|str, val_root=Path|str, batch_size=None|int, epochs=100, checkpoint_path=Path|str|None, num_per_image=int|None)
+    Build a train a model from scratch
+  """
 
   models_root = (Path(__file__) / "../../../models").resolve()
 
@@ -920,6 +922,101 @@ class MNModel:
     """
     return MNModel.models_root / self.name
 
+  def train(self, train_path, val_path, batch_size=None, epochs=100, checkpoint_path=None, num_per_image=180):
+    """
+    Train a new model from scratch
+
+    Parameters
+      --------
+      train_path : Path|str
+        Path to training data root
+      val_path : Path|str
+        Path to validation data root
+      batch_size : int|None
+        Training batch size. If None, will default to self.batch_size
+        (the prediction batch size)
+      epochs : int
+        The number of training epochs
+      checkpoint_path : Path|str|None
+        Where to save checkpoints during training, if not None
+      num_per_image : int|None
+        The number of crops to return per image. If None, will default to
+        [img_width]//crop_size * [[img_height]]//crop_size. Because crops
+        are randomly positioned and can be randomly augmented, more crops
+        can be extracted from a given image than otherwise.
+
+    Returns
+    --------
+    tf.Model
+      The trained model
+    tf.History
+      Model training history
+    """
+    if batch_size is None:
+      batch_size = self.batch_size
+
+    trainer = self._get_trainer(train_path, batch_size, num_per_image)
+    validator = self._get_trainer(val_path, batch_size, num_per_image, augment=False)
+
+    checkpoint_path = checkpoint_root / (self.name + "-" + datetime.today().strftime('%Y-%m-%d') + "-{epoch:04d}.ckpt")
+
+    metrics = self._get_custom_metrics()
+    metric_funs = [ fun for fun in metrics.items() ]
+    metric_funs.append("accuracy")
+
+    model = self._build_model()
+    model.compile(
+      optimizer=self._get_optimizer(),
+      loss=self._get_loss_function(),
+      metrics=metric_funs,
+      loss_weights=self._get_loss_weights()
+    )
+
+    cp_callback = tf.keras.callbacks.ModelCheckpoint(
+      filepath=str(checkpoint_path),
+      save_weights_only=True,
+      verbose=1,
+      save_freq=20*batch_size
+    )
+
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
+
+    early_stop = tf.keras.callbacks.EarlyStopping(
+      monitor='val_mean_iou',
+      min_delta=1e-6,
+      patience=10,
+      verbose=1,
+      mode='max',
+      baseline=None,
+      restore_best_weights=True
+    )
+
+    model.save_weights(str(checkpoint_path).format(epoch=0))
+    model_history = model.fit(
+      trainer,
+      epochs=epochs,
+      steps_per_epoch=trainer.get_training_length(),
+      validation_data=validator,
+      callbacks=[ cp_callback, reduce_lr, early_stop ]
+    )
+
+    return model, model_history
+
+  def _build_model(self):
+    raise MethodNotImplemented("I don't know how to build a model")
+
+  def _get_trainer(self, data_path, batch_size, num_per_image, augment=True):
+    return TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment)
+
+  def _get_optimizer(self, lr=5e-4):
+    return tf.keras.optimizers.Adam(lr)
+
+  def _get_loss_function(self):
+    return self._get_model_metric('sigmoid_focal_crossentropy')
+
+  def _get_loss_weights(self):
+    return [ 1.0, 10.0, 800.0 ]
+
 
 class LaplaceDeconstruction(MNModel):
   """
@@ -1072,6 +1169,26 @@ class LaplaceDeconstruction(MNModel):
 
     return lp
 
+  def _build_model(self):
+    model = AttentionUNet()
+    return model
+
+  def _get_trainer(self, data_path, batch_size, num_per_image, augment=True):
+    def post_process(data_points):
+      for i in range(len(data_points)):
+        lp = self._get_laplacian_pyramid(data_points[i]['image'][...,0], 2)
+        new_img = cv2.pyrUp(new_img, lp[0].shape[1::-1])
+        new_img += lp[0]
+        new_img += sobel(new_img)
+
+        new_img = adjust_gamma(rescale_intensity(new_img, out_range=(0,1)), 2)
+        new_img = np.expand_dims(new_img, axis=-1)
+
+        data_points[i]['image'] = new_img
+
+      return data_points
+    trainer = TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment, post_hooks=post_process)
+
 class Attention(MNModel):
   """
   A basic U-Net with additional attention modules in the decoder.
@@ -1143,6 +1260,18 @@ class MSAttention(Attention):
     predictions = self.trained_model.predict(dataset_batchs, verbose = 0)
 
     return coords, dataset, predictions
+
+  def _build_model(self):
+    model = MSAttentionUNet()
+    return model
+
+  def _get_trainer(self, data_path, batch_size, num_per_image, augment=True):
+    def post_process(data_points):
+      for i in range(len(data_points)):
+        data_points[i]['image'] = np.expand_dims(data_points[i]['image'][...,0], axis=-1)
+
+      return data_points
+    trainer = TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment, post_hooks=post_process)
 
 class MSAttention96(MSAttention):
   """
@@ -1241,7 +1370,6 @@ class SimpleCombined(MNModel):
     
     return nucleus_labels, base_mn_labels, field_output
   
-
 class Combined(MNModel):
   """
   An ensemble predictor
@@ -1319,6 +1447,397 @@ class Combined(MNModel):
 
     return coords, dataset, expanded
 
+class TrainingDataGenerator:
+  """
+  Generates training data
+
+  This assumes the following directory structure:
+    [data_path]/
+      [dataset1]/
+        mn_masks/
+        nucleus_masks/
+        images/
+      [dataset2]/
+        mn_masks/
+        nucleus_masks/
+        images/
+      ...
+
+  MN masks, nucleus masks, and the associated image must share the
+  same name, aside from the suffix. Images and masks can be any format 
+  readable by PIL.Image.open() or TiffFile.imread()
+  
+  This class functions as an iterator, and will iterate through all
+  training data in random order, generating randomly positioned crops 
+  until all images have been cycled through.
+
+  Images may be augmented, MN may have a border class drawn around them,
+  and images without any nuclei or MN masks can be skipped during training.
+
+  Attributes
+  ----------
+  crop_size : int
+    Width and height of crops
+  data_path : Path
+    The root path to training data
+  augment : bool
+    Whether to perform image augmentation
+  draw_border : bool
+    Whether to draw an MN border class around MN segments
+  skip_empty : bool
+    Whether to only return crops that have nucleus or MN segments
+  num_per_image : int|None
+    The number of crops to return per image. If None, will default to
+    [img_width]//crop_size * [[img_height]]//crop_size. Because crops
+    are randomly positioned and can be randomly augmented, more crops
+    can be extracted from a given image than otherwise.
+
+  Static methods
+  --------
+  open_mask(path=Path|str)
+    Gets a mask
+  open_image(path=Path|str)
+    Returns an image as a list of individual channels + their sobel filters
+  get_combined_mask(mn_mask_path=Path|str, pn_mask_path=Path|str)
+    Returns a single numpy array with nuclei = 1 and MN = 2
+  
+
+  Public methods
+  --------
+  crop_image(img_idx=int)
+    Generates crops of both images and masks
+  """
+  def __init__(self, crop_size, data_path, augment=False, draw_border=False, skip_empty=True, num_per_image=None, post_hooks=None):
+    """
+    Constructor
+    
+    Parameters
+    --------
+    crop_size : int
+      Crop width and height
+    data_path : Path|str
+      Path to root of training data
+    augment : bool
+      Whether to perform image augmentation
+    draw_border : bool
+      Whether to inject an additional MN border class, drawn around MN segments
+    skip_empty : bool
+      Whether to only return training data that has nucleus or MN segments
+    num_per_image : int|None
+      The number of crops to return per image. If None, will default to
+      [img_width]//crop_size * [[img_height]]//crop_size. Because crops
+      are randomly positioned and can be randomly augmented, more crops
+      can be extracted from a given image than otherwise.
+    post_hooks : None|list
+      A list of post-processing functions to perform on images
+    """
+    data_path = Path(data_path).resolve()
+    if not data_path.exists():
+      raise FileNotFoundError("Path `{}` does not exist".format(str(data_path)))
+    self.crop_size = crop_size
+    self.data_path = data_path
+    self.augment = augment
+    self.draw_border = draw_border
+    self.skip_empty = skip_empty
+    self.num_per_image = num_per_image
+    self.post_hooks = post_hooks
+
+    dirs = [ x for x in data_path.iterdir() if x.is_dir() ]
+    print("Located {} directories...".format(len(dirs)))
+
+    self.image_paths = []
+    self.mn_masks_paths = []
+    self.pn_masks_paths = []
+
+    mn_mask_dir_name = "mn_masks"
+    pn_mask_dir_name = "nucleus_masks"
+    image_dir_name = "images"
+
+    for d in tqdm(dirs):
+      mask_dir = d / mn_mask_dir_name
+      pn_dir = d / pn_mask_dir_name
+      image_dir = d / image_dir_name
+
+      mask_list = [ x for x in mask_dir.iterdir() if x.is_file() and x.name[0] != "." ]
+
+      for image_name in image_names:
+        self.mn_masks_paths.append(mask_dir / x.name)
+        self.pn_masks_paths.append(pn_dir / x.name)
+        self.image_paths.append(image_dir / x.stem + ".tif")
+
+  def __iter__(self):
+    """
+    Iterator
+
+    Allows this class to be called as an iterator to return 
+    training data
+    
+    Returns
+    --------
+    dict
+      Dictionary with keys:
+        image : np.array
+          The crop
+        segmentation_mask : np.array
+          Ground truth
+        source : Path
+          The image source
+        coords : list
+          Where this crop came from in the image
+    """
+    possible_imgs = random.shuffle(list(range(len(self.image_paths))))
+    for img_idx in possible_imgs:
+      data_points = self.crop_image(img_idx)
+      if self.post_hooks is not None:
+        for fun in self.post_hooks:
+          data_points = fun(data_points)
+
+      for data_point in data_points:
+        yield data_point
+
+  def crop_image(self, img_idx):
+    """
+    Generate crops from a given image
+    
+    Parameters
+    --------
+    img_idx : int
+      The index of which image to crop
+
+    Returns
+    --------
+    list
+      List of dicts as described in __iter__()
+    """
+    image_path = self.image_paths[img_idx]
+    mn_mask_path = self.mn_masks_paths[img_idx]
+    pn_mask_path = self.pn_masks_paths[img_idx]
+
+    channels = TrainingDataGenerator.open_image(image_path)
+    mask = TrainingDataGenerator.get_combined_mask(mn_mask_path, pn_mask_path)
+
+    if self.draw_border:
+      mn_mask = mask.copy()
+      mn_mask[mn_mask[...,0] != 2] = 0
+      outside = dilation(mn_mask, disk(2))
+      mask[(outside != 0) & (mask != 2)] = 3 # Generate boundaries
+
+    datapoints = self._crop_image_random(channels, mask)
+
+    update = { 'source': image_path }
+    datapoints = [ {**x, **update} for x in datapoints ]
+
+    return datapoints
+
+  def _crop_image_random(self, channels, mask):
+    """
+    Generate crops from a given image
+    
+    Parameters
+    --------
+    channels : list
+      The individual channels of an image, + its sobel filters
+    mask : np.array
+      The combined ground truth with nuclei = 1, MN = 2, and (optionally)
+      MN borders = 3
+
+    Returns
+    --------
+    list
+      List of dicts
+    """
+    width = channels[0].shape[1]
+    height = channels[0].shape[0]
+
+    datapoints = []
+    if num_per_image is None:
+      num_per_image = (width//crop_size)*(height//crop_size)
+
+    while len(datapoints) < num_per_image:
+      this_x = randrange(width)
+      this_y = randrange(height)
+
+      left = this_x
+      right = left + self.crop_size
+      top = this_y
+      bottom = top + self.crop_size
+
+      if right > width:
+        right = width
+      if bottom > height:
+        bottom = height
+
+      crop_height = top-bottom
+      crop_width = right-left
+
+      crop = np.zeros(( self.crop_size, self.crop_size, len(channels) ), dtype=channels[0].dtype)
+      crop_mask = np.zeros(( self.crop_size, self.crop_size ), dtype=mask.dtype)
+      for i,channel in enumerate(channels):
+        crop[0:crop_height,0:crop_width,i] = channel[ top:bottom, left:right ]
+        crop_mask[0:crop_height, 0:crop_width] = mask[ top:bottom, left:right ]
+
+      datapoint = {
+        'image': crop,
+        'segmentation_mask': crop_mask,
+        'coords': (left, right, top, bottom)
+      }
+
+      if self.augment:
+        datapoint = self._augment_datapoint(datapoint, sobel_range)
+
+      if self.skip_empty and np.sum(datapoint['segmentation_mask']) <= 0:
+        continue
+
+      datapoints.append(datapoint)
+
+    return datapoints
+
+  def _augment_datapoint(self, datapoint):
+    """
+    Augment a given crop
+    
+    Parameters
+    --------
+    datapoint : dict
+      Dict containing the image and segmentation mask
+    
+    Returns
+    --------
+    dict
+      The modified datapoint
+    """
+    aug = A.Compose([
+      A.HorizontalFlip(p=0.5),
+      A.VerticalFlip(p=0.5),
+      A.Rotate(p=0.5, limit=(-90,270), border_mode=cv2.BORDER_REFLECT),
+      A.Transpose(p=0.5),
+      # A.MaskDropout(p=0.5, max_objects=(0,5), image_fill_value=np.median(datapoint['image'][...,0]))
+      A.Perspective(p=0.3, scale=[0.05, 0.08]),
+      A.ElasticTransform(p=1.0, alpha=12, sigma=15, alpha_affine=5, border_mode=cv2.BORDER_REFLECT, value=0)
+    ])
+
+    augmented = aug(image=datapoint['image'], mask=datapoint['segmentation_mask'])
+    aug_image = augmented['image'][0:self.crop_size,0:self.crop_size,:]
+    
+    return {
+      'image': aug_image,
+      'segmentation_mask': augmented['mask'].astype(datapoint['segmentation_mask'].dtype),
+      'coords': datapoint['coords']
+    }
+
+  @staticmethod
+  def open_mask(path):
+    """
+    Get nucleus or MN mask
+    
+    Parameters
+    --------
+    path : Path|str
+      Path to the mask
+    
+    Returns
+    --------
+    np.array
+      The mask
+    """
+    if strlower(path.suffix) == "tiff" or strlower(path.suffix) == "tif":
+      img = tifffile.imread(path)
+    else:
+      img = np.array(Image.open(path))
+
+    img = MNModel.normalize_dimensions(img)
+    return img
+
+  @staticmethod
+  def open_image(path):
+    """
+    Get image
+    
+    Parameters
+    --------
+    path : Path|str
+      Path to the image
+    
+    Returns
+    --------
+    list
+      The individual channels split into a list +
+      sobel filters on each channel
+    """
+    if strlower(path.suffix) == "tiff" or strlower(path.suffix) == "tif":
+      img = tifffile.imread(path)
+    else:
+      img = np.array(Image.open(path))
+
+    img = MNModel.normalize_dimensions(img)
+    channels = []
+    edges = []
+    for channel in range(img.shape[2]):
+      channels.append(MNModel.normalize_image(img[...,channel]))
+
+    edges = [ sobel(x) for x in channels ]
+    edges = [ MNModel.normalize_image(x) for x in edges ]
+
+    channels += edges
+    return channels
+
+  @staticmethod
+  def get_combined_mask(mn_mask_path, pn_mask_path):
+    """
+    Read nucleis and MN masks and combine into a single image
+
+    Nuclei = 1, MN = 2
+    
+    Parameters
+    --------
+    mn_mask_path : Path|str
+      Path to the MN mask
+    pn_mask_path : Path|str
+      Path to the nucleus mask
+    
+    Returns
+    --------
+    np.array
+    """
+    pn_details = TrainingDataGenerator.open_mask(pn_mask_path)
+    mn_details = TrainingDataGenerator.open_mask(mn_mask_path)
+
+    mask = np.zeros(( pn_details.shape[0], pn_details.shape[1] ), dtype=np.uint8)
+    mask[(pn_details[...,0] > 0)] = 1 # Nucleus
+    mask[(mn_details[...,0] > 0)] = 2 # MN
+
+    return mask
+
+class TFData(Sequence):
+  def __init__(self, crop_size, data_path, batch_size, num_per_image=None, **kwargs):
+    self.dg = TrainingDataGenerator(
+      crop_size,
+      data_path,
+      num_per_image=num_per_image,
+      **kwargs
+    )
+    self.num_images = len(self.dg.mn_masks_paths)
+    self.num_per_image = num_per_image
+    self.batch_size = batch_size
+
+  def __len__(self):
+    self.num_images*self.num_per_image
+
+  def __getitem__(self, idx):
+    batch_x = []
+    batch_y = []
+
+    i = 0
+    for dp in self.dg:
+      batch_x.append(dp['image'])
+      batch_y.append(dp['segmentation_mask'])
+      i += 1
+      if i >= self.batch_size:
+        break
+
+    return np.array(batch_x), np.array(batch_y)
+
+
 class IncorrectDimensions(Exception):
   "Images must be (x,y,c) or (x,y)"
   pass
@@ -1329,4 +1848,8 @@ class ModelNotFound(Exception):
 
 class ModelNotLoaded(Exception):
   "That model could not be loaded"
+  pass
+
+class MethodNotImplemented(Exception):
+  "That method has not been implemented"
   pass
