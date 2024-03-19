@@ -946,9 +946,9 @@ class MNModel:
     Parameters
       --------
       train_path : Path|str|None
-        Path to training data root. If None, will use this packages training data.
+        Path to training data root. If None, will use this package's training data.
       val_path : Path|str
-        Path to validation data root. If None, will use this packages training data.
+        Path to validation data root. If None, will use this package's training data.
       batch_size : int|None
         Training batch size. If None, will default to self.batch_size
         (the prediction batch size)
@@ -1033,11 +1033,11 @@ class MNModel:
       callbacks=callbacks
     )
 
-    # if save_weights:
-    #   if save_path is None:
-    #     save_path = self.models_root / self.__class__.__name__
+    if save_weights:
+      if save_path is None:
+        save_path = self.models_root / self.__class__.__name__
 
-    #   model.save(str(save_path))
+      model.save(str(save_path))
 
     return model, model_history
 
@@ -1353,7 +1353,6 @@ class SimpleCombined(MNModel):
     ]
 
     self.model_url = None
-    self.defaults.privilege_nuclei = False
     
   def _load_model(self):
     return True
