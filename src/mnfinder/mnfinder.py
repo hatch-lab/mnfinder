@@ -2,6 +2,7 @@ from csbdeep.utils import normalize
 from pathlib import Path
 import tensorflow as tf
 import tensorflow.keras.backend as K
+from tensorflow.keras.utils import Sequence
 import json
 from skimage.filters import sobel
 from skimage.measure import regionprops_table, label
@@ -17,9 +18,13 @@ import requests
 import tarfile
 from tqdm import tqdm
 import math
+import warnings
+import random
+from PIL import Image
+import albumentations as A
 
 import matplotlib.pyplot as plt
-from models import AttentionUNet, MSAttentionUNet
+from .models import AttentionUNet, MSAttentionUNet
 
 class MNModelDefaults:
   """
@@ -100,6 +105,7 @@ class MNModel:
   """
 
   models_root = (Path(__file__) / "../../../models").resolve()
+  training_root = (Path(__file__) / "../../../training").resolve()
 
   @staticmethod
   def get_available_models():
@@ -374,14 +380,23 @@ class MNModel:
 
     self._load_model()
 
-  def _load_model(self):
+  def _load_model(self, model_path=None):
     """
     Load the trained model weights
 
     If the model weights have not yet been downloaded, will fetch the tar.gz
     and unpack the files
+
+    Parameters
+    --------
+    model_path : str|Path|None
+      Where the model weights are stored. If None, defaults to models/[model_name]
     """
-    model_path = self.models_root / self.__class__.__name__
+    if model_path is None:
+      model_path = self.models_root / self.__class__.__name__
+    else:
+      model_path = Path(model_path).resolve()
+
     model_gzip_path = self.models_root / (self.__class__.__name__ + ".tar.gz")
     if not model_path.exists():
       # Try to download
@@ -407,11 +422,13 @@ class MNModel:
 
       model_gzip_path.unlink()
 
+    warnings.filterwarnings("ignore", message=".*Unable to restore custom metric.*")
     self.trained_model = tf.keras.models.load_model(
       str(self._get_path()), 
-      compile=False, 
-      custom_objects=self._get_custom_metrics()
+      custom_objects=self._get_custom_metrics(),
+      compile=False
     )
+    warnings.resetwarnings()
   
   def predict(self, img, skip_opening=None, expand_masks=None, use_argmax=None, area_thresh=250, **kwargs):
     """
@@ -466,7 +483,7 @@ class MNModel:
       field_output = self._blend_crop(field_output, predictions[idx], coords[idx])
 
     field_labels = np.argmax(field_output, axis=-1).astype(np.uint8)
-    nucleus_labels = (field_lables == 1).astype(np.uint8)
+    nucleus_labels = (field_labels == 1).astype(np.uint8)
     if use_argmax:
       mn_labels = (field_labels == 2).astype(np.uint8)
     else:
@@ -477,12 +494,12 @@ class MNModel:
 
     if area_thresh is not False and area_thresh > 0:
       possible_mn_info = pd.DataFrame(regionprops_table(nucleus_labels, properties=('label', 'area')))
-      switch_labels = mn_info['label'].loc[(mn_info['area'] < area_thresh)]
+      switch_labels = possible_mn_info['label'].loc[(possible_mn_info['area'] < area_thresh)]
       nucleus_labels[np.isin(nucleus_labels, switch_labels)] = 0
       mn_labels[np.isin(nucleus_labels, switch_labels)] = 1
 
     if not skip_opening:
-      mn_labels = binary_opening(mn_labels, footprint=disk(self.defaults.opening_footprint)).astype(np.uint8)
+      mn_labels = binary_opening(mn_labels, footprint=disk(self.defaults.opening_radius)).astype(np.uint8)
     mn_labels = clear_border(mn_labels)
     mn_labels = label(mn_labels, connectivity=1)
 
@@ -686,16 +703,16 @@ class MNModel:
     np.array
       The modified labels
     """
-    new_field_labels = np.zeros_like(field_labels)
-    for field_label in np.unique(field_labels):
-      if field_label == 0:
+    new_mn_labels = np.zeros_like(mn_labels)
+    for mn_label in np.unique(mn_labels):
+      if mn_label == 0:
         continue
-      img_copy = np.zeros_like(field_labels, dtype=bool)
-      img_copy[field_labels == field_label] = True
+      img_copy = np.zeros_like(mn_labels, dtype=bool)
+      img_copy[mn_labels == mn_label] = True
       img_copy = convex_hull_image(img_copy)
-      new_field_labels[img_copy] = field_label
+      new_mn_labels[img_copy] = mn_label
 
-    return new_field_labels
+    return new_mn_labels
 
   @staticmethod
   def _get_model_metric(name):
@@ -715,6 +732,42 @@ class MNModel:
     fun
       The function
     """
+    def _safe_mean(losses, num_present):
+      """
+      Computes a safe mean of the losses.
+
+      Parameters
+      --------
+      losses : tensor
+        Individual loss measurements
+      num_present : int
+        The number of measurable elements
+      
+      Returns
+      --------
+      float
+        Mean of losses unless num_present == 0, in which case 0 is returned
+      """
+      total_loss = tf.reduce_sum(losses)
+      return tf.math.divide_no_nan(total_loss, num_present, name="value")
+
+    def _num_elements(losses):
+      """
+      Computes the number of elements in losses tensor
+
+      Parameters
+      --------
+      losses : tensor
+        Individual loss measurements
+      
+      Returns
+      --------
+      int
+        The number of elements
+      """
+      with K.name_scope("num_elements") as scope:
+        return tf.cast(tf.size(losses, name=scope), dtype=losses.dtype)
+
     def sigmoid_focal_crossentropy(y_true, y_pred, alpha = 0.25, gamma = 2.0, from_logits = False,):
       """
       Implements the focal loss function.
@@ -737,48 +790,11 @@ class MNModel:
       tensor
         Weighted loss float tensor
       """
-
-      def _safe_mean(losses, num_present):
-        """
-        Computes a safe mean of the losses.
-
-        Parameters
-        --------
-        losses : tensor
-          Individual loss measurements
-        num_present : int
-          The number of measurable elements
-        
-        Returns
-        --------
-        float
-          Mean of losses unless num_present == 0, in which case 0 is returned
-        """
-        total_loss = tf.reduce_sum(losses)
-        return tf.math.divide_no_nan(total_loss, num_present, name="value")
-
-      def _num_elements(losses):
-        """
-        Computes the number of elements in losses tensor
-
-        Parameters
-        --------
-        losses : tensor
-          Individual loss measurements
-        
-        Returns
-        --------
-        int
-          The number of elements
-        """
-        with K.name_scope("num_elements") as scope:
-          return tf.cast(tf.size(losses, name=scope), dtype=losses.dtype)
-
       if gamma and gamma < 0:
         raise ValueError("Value of gamma should be greater than or equal to zero.")
 
       y_pred = tf.convert_to_tensor(y_pred)
-      y_true = tf.cast(K.one_hot(tf.cast(y_true, tf.uint8), num_classes=4), dtype=y_pred.dtype)
+      y_true = tf.cast(K.one_hot(tf.cast(y_true, tf.uint8), num_classes=3), dtype=y_pred.dtype)
 
       # Get the cross_entropy for each entry
       ce = K.binary_crossentropy(y_true, y_pred, from_logits=from_logits)
@@ -909,7 +925,8 @@ class MNModel:
       'sigmoid_focal_crossentropy_loss': self._get_model_metric('sigmoid_focal_crossentropy_loss'), 
       'sigmoid_focal_crossentropy': self._get_model_metric('sigmoid_focal_crossentropy'),
       'mean_iou': self._get_model_metric('mean_iou'),
-      'mean_iou_with_nuc': self._get_model_metric('mean_iou_with_nuc')
+      'mean_iou_with_nuc': self._get_model_metric('mean_iou_with_nuc'),
+      'K': tf.keras.backend
     }
 
   def _get_path(self):
@@ -922,16 +939,16 @@ class MNModel:
     """
     return MNModel.models_root / self.name
 
-  def train(self, train_path, val_path, batch_size=None, epochs=100, checkpoint_path=None, num_per_image=180):
+  def train(self, train_path=None, val_path=None, batch_size=None, epochs=100, checkpoint_path=None, num_per_image=180, save_weights=True, save_path=None):
     """
     Train a new model from scratch
 
     Parameters
       --------
-      train_path : Path|str
-        Path to training data root
+      train_path : Path|str|None
+        Path to training data root. If None, will use this packages training data.
       val_path : Path|str
-        Path to validation data root
+        Path to validation data root. If None, will use this packages training data.
       batch_size : int|None
         Training batch size. If None, will default to self.batch_size
         (the prediction batch size)
@@ -944,6 +961,10 @@ class MNModel:
         [img_width]//crop_size * [[img_height]]//crop_size. Because crops
         are randomly positioned and can be randomly augmented, more crops
         can be extracted from a given image than otherwise.
+      save_weights : bool
+        Whether to save the model weights
+      save_path : str|Path|None
+        Where to save model weights. If None, will default to modesl/[model_name]
 
     Returns
     --------
@@ -955,13 +976,20 @@ class MNModel:
     if batch_size is None:
       batch_size = self.batch_size
 
+    if train_path is None:
+      train_path = self.training_root
+
+    if val_path is None:
+      val_path = self.training_root
+
     trainer = self._get_trainer(train_path, batch_size, num_per_image)
     validator = self._get_trainer(val_path, batch_size, num_per_image, augment=False)
 
-    checkpoint_path = checkpoint_root / (self.name + "-" + datetime.today().strftime('%Y-%m-%d') + "-{epoch:04d}.ckpt")
+    if checkpoint_path is not None:
+      checkpoint_path = Path(checkpoint_path) / (self.name + "-" + datetime.today().strftime('%Y-%m-%d') + "-{epoch:04d}.ckpt")
 
     metrics = self._get_custom_metrics()
-    metric_funs = [ fun for fun in metrics.items() ]
+    metric_funs = [ fun for k,fun in metrics.items() if k != "K" ]
     metric_funs.append("accuracy")
 
     model = self._build_model()
@@ -970,13 +998,6 @@ class MNModel:
       loss=self._get_loss_function(),
       metrics=metric_funs,
       loss_weights=self._get_loss_weights()
-    )
-
-    cp_callback = tf.keras.callbacks.ModelCheckpoint(
-      filepath=str(checkpoint_path),
-      save_weights_only=True,
-      verbose=1,
-      save_freq=20*batch_size
     )
 
     reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
@@ -991,14 +1012,32 @@ class MNModel:
       restore_best_weights=True
     )
 
-    model.save_weights(str(checkpoint_path).format(epoch=0))
+    callbacks = [ reduce_lr, early_stop ]
+
+    if checkpoint_path is not None:
+      cp_callback = tf.keras.callbacks.ModelCheckpoint(
+        filepath=str(checkpoint_path),
+        save_weights_only=True,
+        verbose=1,
+        save_freq=20*batch_size
+      )
+      callbacks.append(cp_callback)
+
+      model.save_weights(str(checkpoint_path).format(epoch=0))
+
     model_history = model.fit(
       trainer,
       epochs=epochs,
-      steps_per_epoch=trainer.get_training_length(),
+      steps_per_epoch=len(trainer),
       validation_data=validator,
-      callbacks=[ cp_callback, reduce_lr, early_stop ]
+      callbacks=callbacks
     )
+
+    # if save_weights:
+    #   if save_path is None:
+    #     save_path = self.models_root / self.__class__.__name__
+
+    #   model.save(str(save_path))
 
     return model, model_history
 
@@ -1039,7 +1078,7 @@ class LaplaceDeconstruction(MNModel):
     self.fg_min = 0.1
    
     self.defaults.use_argmax = False
-    self.defaults.opening_footprint = 2
+    self.defaults.opening_radius = 2
 
   def _get_mn_predictions(self, img):
     """
@@ -1170,13 +1209,14 @@ class LaplaceDeconstruction(MNModel):
     return lp
 
   def _build_model(self):
-    model = AttentionUNet()
-    return model
+    factory = AttentionUNet()
+    return factory.build(self.crop_size, 1, 3)
 
   def _get_trainer(self, data_path, batch_size, num_per_image, augment=True):
     def post_process(data_points):
       for i in range(len(data_points)):
         lp = self._get_laplacian_pyramid(data_points[i]['image'][...,0], 2)
+        new_img = lp[1]
         new_img = cv2.pyrUp(new_img, lp[0].shape[1::-1])
         new_img += lp[0]
         new_img += sobel(new_img)
@@ -1187,7 +1227,7 @@ class LaplaceDeconstruction(MNModel):
         data_points[i]['image'] = new_img
 
       return data_points
-    trainer = TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment, post_hooks=post_process)
+    return TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment, post_hooks=[ post_process ])
 
 class Attention(MNModel):
   """
@@ -1207,7 +1247,11 @@ class Attention(MNModel):
     self.bg_max = 0.59
     self.fg_min = 0.24
 
-class Attention96(MNModel):
+  def _build_model(self):
+    factory = AttentionUNet()
+    return factory.build(self.crop_size, 2, 3)
+
+class Attention96(Attention):
   """
   A basic U-Net with additional attention modules in the decoder, but using a 96x96 crop size.
 
@@ -1217,6 +1261,7 @@ class Attention96(MNModel):
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention96.tar.gz'
 
     super().__init__()
+    self.crop_size = 96
     self.defaults.use_argmax = True
 
     self.bg_max = 0.59
@@ -1239,7 +1284,7 @@ class MSAttention(Attention):
 
     self.bg_max = 0.6
     self.fg_min = 0.3
-    self.defaults.opening_footprint = 2
+    self.defaults.opening_radius = 2
 
   def _get_mn_predictions(self, img):
     tensors = []
@@ -1262,8 +1307,8 @@ class MSAttention(Attention):
     return coords, dataset, predictions
 
   def _build_model(self):
-    model = MSAttentionUNet()
-    return model
+    factory = MSAttentionUNet()
+    return factory.build(self.crop_size, 1, 3)
 
   def _get_trainer(self, data_path, batch_size, num_per_image, augment=True):
     def post_process(data_points):
@@ -1271,7 +1316,7 @@ class MSAttention(Attention):
         data_points[i]['image'] = np.expand_dims(data_points[i]['image'][...,0], axis=-1)
 
       return data_points
-    trainer = TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment, post_hooks=post_process)
+    return TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment, post_hooks=[ post_process ])
 
 class MSAttention96(MSAttention):
   """
@@ -1289,7 +1334,7 @@ class MSAttention96(MSAttention):
     self.crop_size = 96
     self.bg_max = 0.6
     self.fg_min = 0.25
-    self.defaults.opening_footprint = 1
+    self.defaults.opening_radius = 1
 
 class SimpleCombined(MNModel):
   """
@@ -1393,9 +1438,6 @@ class Combined(MNModel):
     self.bg_max = 0.55
     self.fg_min = 0.27
 
-  # def _load_model(self):
-  #   return True
-
   def _get_mn_predictions(self, img):
     """
     Crops an image and generates a list of neural net predictions of each
@@ -1446,6 +1488,27 @@ class Combined(MNModel):
       expanded[idx][...,2] = prediction[...,1]
 
     return coords, dataset, expanded
+
+  def _build_model(self):
+    model = AttentionUNet(self.crop_size, 2, 3)
+    return model
+
+  def _get_trainer(self, data_path, batch_size, num_per_image, augment=True):
+    def post_process(data_points):
+      for i in range(len(data_points)):
+        channels = []
+        for model in self.models:
+          if model.name == 'Attention':
+            _, _, mn_raw = model.predict(data_points[i]['image'])
+          else:
+            _, _, mn_raw = model.predict(np.expand_dims(data_points[i]['image'][...,0], axis=-1))
+
+          channels.append(mn_raw)
+
+        data_points[i]['image'] = np.stack(channels, axis=-1)
+
+      return data_points
+    return TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment, post_hooks=[ post_process ])
 
 class TrainingDataGenerator:
   """
@@ -1560,10 +1623,10 @@ class TrainingDataGenerator:
 
       mask_list = [ x for x in mask_dir.iterdir() if x.is_file() and x.name[0] != "." ]
 
-      for image_name in image_names:
+      for x in mask_list:
         self.mn_masks_paths.append(mask_dir / x.name)
         self.pn_masks_paths.append(pn_dir / x.name)
-        self.image_paths.append(image_dir / x.stem + ".tif")
+        self.image_paths.append(image_dir / (x.stem + ".tif"))
 
   def __iter__(self):
     """
@@ -1585,7 +1648,8 @@ class TrainingDataGenerator:
         coords : list
           Where this crop came from in the image
     """
-    possible_imgs = random.shuffle(list(range(len(self.image_paths))))
+    possible_imgs = list(range(len(self.image_paths)))
+    random.shuffle(possible_imgs)
     for img_idx in possible_imgs:
       data_points = self.crop_image(img_idx)
       if self.post_hooks is not None:
@@ -1650,12 +1714,14 @@ class TrainingDataGenerator:
     height = channels[0].shape[0]
 
     datapoints = []
-    if num_per_image is None:
+    if self.num_per_image is None:
       num_per_image = (width//crop_size)*(height//crop_size)
+    else:
+      num_per_image = self.num_per_image
 
     while len(datapoints) < num_per_image:
-      this_x = randrange(width)
-      this_y = randrange(height)
+      this_x = random.randrange(width)
+      this_y = random.randrange(height)
 
       left = this_x
       right = left + self.crop_size
@@ -1667,7 +1733,7 @@ class TrainingDataGenerator:
       if bottom > height:
         bottom = height
 
-      crop_height = top-bottom
+      crop_height = bottom-top
       crop_width = right-left
 
       crop = np.zeros(( self.crop_size, self.crop_size, len(channels) ), dtype=channels[0].dtype)
@@ -1683,7 +1749,7 @@ class TrainingDataGenerator:
       }
 
       if self.augment:
-        datapoint = self._augment_datapoint(datapoint, sobel_range)
+        datapoint = self._augment_datapoint(datapoint)
 
       if self.skip_empty and np.sum(datapoint['segmentation_mask']) <= 0:
         continue
@@ -1740,7 +1806,7 @@ class TrainingDataGenerator:
     np.array
       The mask
     """
-    if strlower(path.suffix) == "tiff" or strlower(path.suffix) == "tif":
+    if path.suffix.lower() == "tiff" or path.suffix.lower() == "tif":
       img = tifffile.imread(path)
     else:
       img = np.array(Image.open(path))
@@ -1764,7 +1830,7 @@ class TrainingDataGenerator:
       The individual channels split into a list +
       sobel filters on each channel
     """
-    if strlower(path.suffix) == "tiff" or strlower(path.suffix) == "tif":
+    if path.suffix.lower() == "tiff" or path.suffix.lower() == "tif":
       img = tifffile.imread(path)
     else:
       img = np.array(Image.open(path))
@@ -1821,7 +1887,7 @@ class TFData(Sequence):
     self.batch_size = batch_size
 
   def __len__(self):
-    self.num_images*self.num_per_image
+    return self.num_images*self.num_per_image
 
   def __getitem__(self, idx):
     batch_x = []

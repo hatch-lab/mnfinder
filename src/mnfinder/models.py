@@ -1,28 +1,29 @@
 import tensorflow as tf
 import tensorflow.keras.layers as nn
 from keras.backend import concatenate
+from tensorflow.keras import Model
 
 # Adapted from 
 # https://github.com/lixiaolei1982/Keras-Implementation-of-U-Net-R2U-Net-Attention-U-Net-Attention-R2U-Net.-/blob/master/network.py
 class AttentionUNet:
-  def __init__(self, crop_size, num_input_channels, num_output_classes, depth=4):
+  def build(self, crop_size, num_input_channels, num_output_classes, depth=4):
     inputs = nn.Input(( crop_size, crop_size, num_input_channels ))
     x = inputs
 
     features = 64
     skips = []
     for i in range(depth):
-      x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')
+      x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
       x = nn.Dropout(0.2)(x)
-      x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')
+      x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
       skips.append(x)
-      x = nn.MaxPooling2D((2, 2), data_format='channels_last')
+      x = nn.MaxPooling2D((2, 2), data_format='channels_last')(x)
       features *= 2
 
     # Bottleneck
-    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')
+    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')(x)
     x = nn.Dropout(0.2)(x)
-    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')
+    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')(x)
 
     for i in reversed(range(depth)):
       features = features // 2
@@ -33,7 +34,7 @@ class AttentionUNet:
 
     conv6 = nn.Conv2D(num_output_classes, (1, 1), padding='same', data_format='channels_last')(x)
     conv7 = nn.Activation('sigmoid')(conv6)
-    model = tf.Model(inputs=inputs, outputs=conv7)
+    model = Model(inputs=inputs, outputs=conv7)
 
     return model
 
@@ -64,7 +65,7 @@ class AttentionUNet:
     phi_g = nn.Conv2D(inter_channel, [1, 1], strides=[1, 1], data_format=data_format)(g)
 
     # f(?,g_height,g_width,inter_channel)
-    f = nn.Activation('relu')(add([theta_x, phi_g]))
+    f = nn.Activation('relu')(nn.Add()([theta_x, phi_g]))
 
     # psi_f(?,g_height,g_width,1)
     psi_f = nn.Conv2D(1, [1, 1], strides=[1, 1], data_format=data_format)(f)
@@ -73,12 +74,12 @@ class AttentionUNet:
     # rate(?,x_height,x_width)
 
     # att_x(?,x_height,x_width,x_channel)
-    att_x = nn.Multiply([x, rate])
+    att_x = nn.Multiply()([x, rate])
 
     return att_x
 
 class MSAttentionUNet(AttentionUNet):
-  def __init__(self):
+  def build(self, crop_size, num_input_channels, num_output_classes, depth=4):
     inputs = nn.Input(( crop_size, crop_size, num_input_channels ))
     x = inputs
 
@@ -92,9 +93,9 @@ class MSAttentionUNet(AttentionUNet):
     features *= 2
 
     # Bottleneck
-    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')
+    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')(x)
     x = nn.Dropout(0.2)(x)
-    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')
+    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')(x)
 
     for i in reversed(range(1,depth)):
       features = features // 2
@@ -110,7 +111,7 @@ class MSAttentionUNet(AttentionUNet):
 
     conv6 = nn.Conv2D(num_output_classes, (1, 1), padding='same', data_format='channels_last')(x)
     conv7 = nn.Activation('sigmoid')(conv6)
-    model = tf.Model(inputs=inputs, outputs=conv7)
+    model = Model(inputs=inputs, outputs=conv7)
 
     return model
 

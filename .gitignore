@@ -2,5 +2,6 @@
 */__pycache__/*
 ._*
 models/*/*
+models/*.tar.gz
 __pycache__
 dist/*
