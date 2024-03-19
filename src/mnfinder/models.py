@@ -6,7 +6,32 @@ from tensorflow.keras import Model
 # Adapted from 
 # https://github.com/lixiaolei1982/Keras-Implementation-of-U-Net-R2U-Net-Attention-U-Net-Attention-R2U-Net.-/blob/master/network.py
 class AttentionUNet:
+  """
+  Builds a standard U-Net with attention in the up-blocks
+  """
   def build(self, crop_size, num_input_channels, num_output_classes, depth=4):
+    """
+    Build and return the network model
+
+    Input assumes channels are last, with image shapes being
+    (crop_size, crop_size, num_input_channels)
+
+    Parameters
+    --------
+    crop_size : int
+      The width and height of each image
+    num_input_channels : int
+      The number of channels
+    num_output_classes : int
+      The number of output classes
+    depth : int
+      The depth of the neural net
+    
+    Returns
+    --------
+    tf.keras.Model
+      The built model
+    """
     inputs = nn.Input(( crop_size, crop_size, num_input_channels ))
     x = inputs
 
@@ -27,7 +52,7 @@ class AttentionUNet:
 
     for i in reversed(range(depth)):
       features = features // 2
-      x = self.attention_up_and_concat(x, skips[i], data_format='channels_last')
+      x = self._attention_up_and_concat(x, skips[i], data_format='channels_last')
       x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
       x = nn.Dropout(0.2)(x)
       x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
@@ -38,7 +63,24 @@ class AttentionUNet:
 
     return model
 
-  def attention_up_and_concat(self, down_layer, layer, data_format='channels_last'):
+  def _attention_up_and_concat(self, down_layer, layer, data_format='channels_last'):
+    """
+    Build the attention+up block
+
+    Parameters
+    --------
+    down_layer : tf.layers.Layer
+      The layer to up-sample
+    layer : tf.layers.Layer
+      The down-layer to make a skip connection
+    data_format : str
+      Can be 'channels_last' or 'channels_first'
+    
+    Returns
+    --------
+    tf.layers.Layer
+      The concatenated up-sampled and skip-connection layers
+    """
     if data_format == 'channels_first':
       in_channel = down_layer.get_shape().as_list()[1]
     else:
@@ -47,7 +89,7 @@ class AttentionUNet:
     # up = Conv2DTranspose(out_channel, [2, 2], strides=[2, 2])(down_layer)
     up = nn.UpSampling2D(size=(2, 2), data_format=data_format)(down_layer)
 
-    layer = self.attention_block_2d(x=layer, g=up, inter_channel=in_channel // 4, data_format=data_format)
+    layer = self._attention_block_2d(x=layer, g=up, inter_channel=in_channel // 4, data_format=data_format)
 
     if data_format == 'channels_first':
       my_concat = nn.Lambda(lambda x: concatenate([x[0], x[1]], axis=1))
@@ -57,7 +99,29 @@ class AttentionUNet:
     concat = my_concat([up, layer])
     return concat
 
-  def attention_block_2d(self, x, g, inter_channel, data_format='channels_last'):
+  def _attention_block_2d(self, x, g, inter_channel, data_format='channels_last'):
+    """
+    Build the attention block
+
+    From 
+    https://github.com/lixiaolei1982/Keras-Implementation-of-U-Net-R2U-Net-Attention-U-Net-Attention-R2U-Net.-/blob/master/network.py
+
+    Parameters
+    --------
+    x : tf.layers.Layer
+      The skip connection
+    g : tf.layers.Layer
+      The up-sampled layer
+    inter_channel : int
+      The number of channels
+    data_format : str
+      Can be 'channels_last' or 'channels_first'
+    
+    Returns
+    --------
+    tf.layers.Layer
+      The attention block
+    """
     # theta_x(?,g_height,g_width,inter_channel)
     theta_x = nn.Conv2D(inter_channel, [1, 1], strides=[1, 1], data_format=data_format)(x)
 
@@ -79,7 +143,40 @@ class AttentionUNet:
     return att_x
 
 class MSAttentionUNet(AttentionUNet):
+  """
+  Builds a modified U-Net with attention in the up-blocks
+
+  Each downblock is modified to perform a multi-scale convolution:
+  inputs are sent in parallel through 3 convolution layers:
+    * strides (1,1)
+    * strides (2,2) -> upsampled(2,2)
+    * strides (4,4) -> upsampled(4,4)
+  The 3 layers are concatenated and the maxi intensity projection is taken
+
+  """
   def build(self, crop_size, num_input_channels, num_output_classes, depth=4):
+    """
+    Build and return the network model
+
+    Input assumes channels are last, with image shapes being
+    (crop_size, crop_size, num_input_channels)
+
+    Parameters
+    --------
+    crop_size : int
+      The width and height of each image
+    num_input_channels : int
+      The number of channels
+    num_output_classes : int
+      The number of output classes
+    depth : int
+      The depth of the neural net
+    
+    Returns
+    --------
+    tf.keras.Model
+      The built model
+    """
     inputs = nn.Input(( crop_size, crop_size, num_input_channels ))
     x = inputs
 
@@ -115,7 +212,24 @@ class MSAttentionUNet(AttentionUNet):
 
     return model
 
-  def ms_down_block(self, x, features, data_format):
+  def ms_down_block(self, x, features, data_format='channels_last'):
+    """
+    Build the multi-scale down block
+
+    Parameters
+    --------
+    x : tf.layers.Layer
+      The input layer
+    features : int
+      The number of features
+    data_format : str
+      Can be 'channels_last' or 'channels_first'
+    
+    Returns
+    --------
+    tf.layers.Layer
+      The concatenated up-sampled and skip-connection layers
+    """
     x1 = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format=data_format)(x)
     x2 = nn.Conv2D(features, (3, 3), strides=(2,2), activation='relu', padding='same', data_format=data_format)(x)
     x3 = nn.Conv2D(features, (3, 3), strides=(4,4), activation='relu', padding='same', data_format=data_format)(x)
