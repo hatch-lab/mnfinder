@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnfinder"
-version = "0.1.6"
+version = "1.0.0"
 authors = [{ name = "Lucian DiPeso", email="ldipeso@uw.edu" }]
 description = "A package for segmenting micronuclei in microscopy images"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
@@ -23,8 +23,9 @@ dependencies = [
   "tqdm",
   "opencv-contrib-python",
   "docopt",
-  "stardist",
-  "csbdeep"
+  "csbdeep",
+  "albumentations",
+  "Pillow"
 ]
 keywords = [
   "micronucleus",

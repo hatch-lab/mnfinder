@@ -22,8 +22,8 @@ import warnings
 import random
 from PIL import Image
 import albumentations as A
+from datetime import datetime
 
-import matplotlib.pyplot as plt
 from .models import AttentionUNet, MSAttentionUNet
 
 class MNModelDefaults:
@@ -52,6 +52,10 @@ class MNModel:
   ----------
   models_root : Path
     Where model files are stored
+  training_root : Path
+    Where training data is stored
+  testing_root : Path
+    Where testing data is stored
   crop_size : int
     The input width and height of the model
   oversample_size : int
@@ -106,6 +110,7 @@ class MNModel:
 
   models_root = (Path(__file__) / "../../../models").resolve()
   training_root = (Path(__file__) / "../../../training").resolve()
+  testing_root = (Path(__file__) / "../../../testing").resolve()
 
   @staticmethod
   def get_available_models():
@@ -471,7 +476,7 @@ class MNModel:
     if use_argmax is None:
       use_argmax = self.defaults.use_argmax
 
-    img = self.normalize_image(self.normalize_dimensions(img))
+    img = self.normalize_dimensions(img)
     if img.shape[0] < self.crop_size or img.shape[1] < self.crop_size:
       raise ValueError("Image is smaller than minimum size of {}x{}".format(self.crop_size, self.crop_size))
 
@@ -1736,10 +1741,14 @@ class TrainingDataGenerator:
       crop_width = right-left
 
       crop = np.zeros(( self.crop_size, self.crop_size, len(channels) ), dtype=channels[0].dtype)
-      crop_mask = np.zeros(( self.crop_size, self.crop_size ), dtype=mask.dtype)
+      if len(mask.shape) == 3:
+        crop_mask = np.zeros(( self.crop_size, self.crop_size, mask.shape[2] ), dtype=mask.dtype)
+      else:
+        crop_mask = np.zeros(( self.crop_size, self.crop_size ), dtype=mask.dtype)
+
       for i,channel in enumerate(channels):
         crop[0:crop_height,0:crop_width,i] = channel[ top:bottom, left:right ]
-        crop_mask[0:crop_height, 0:crop_width] = mask[ top:bottom, left:right ]
+      crop_mask[0:crop_height, 0:crop_width] = mask[ top:bottom, left:right ]
 
       datapoint = {
         'image': crop,
