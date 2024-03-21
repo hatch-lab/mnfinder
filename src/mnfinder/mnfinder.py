@@ -23,9 +23,14 @@ import random
 from PIL import Image
 import albumentations as A
 from datetime import datetime
-from appdirs import AppDirs
+from platformdirs import PlatformDirs
 
 from .models import AttentionUNet, MSAttentionUNet
+
+__version__ = "1.0.1"
+dirs = PlatformDirs("MNFinder", "Hatch-Lab", __version__)
+Path(dirs.user_data_dir).parent.mkdir(exist_ok=True)
+Path(dirs.user_data_dir).mkdir(exist_ok=True)
 
 class MNModelDefaults:
   """
@@ -108,8 +113,6 @@ class MNModel:
   train(train_root=Path|str, val_root=Path|str, batch_size=None|int, epochs=100, checkpoint_path=Path|str|None, num_per_image=int|None)
     Build a train a model from scratch
   """
-  __version__ = "1.0.1"
-  dirs = AppDir("MNFinder", "Hatch-Lab", __version__)
   models_root = (Path(dirs.user_data_dir) / "models").resolve()
   training_root = (Path(__file__) / "../training").resolve()
   testing_root = (Path(__file__) / "../testing").resolve()
@@ -1261,9 +1264,9 @@ class Attention(MNModel):
 
   Trained on single-channel images + Sobel
   """
-  def __init__(self, weights_path=None, trained_model=None):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention.tar.gz'
+  model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention.tar.gz'
 
+  def __init__(self, weights_path=None, trained_model=None):
     super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.crop_size = 128
@@ -1283,9 +1286,9 @@ class Attention96(Attention):
 
   Trained on single-channel images + Sobel
   """
-  def __init__(self, weights_path=None, trained_model=None):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention96.tar.gz'
+  model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention96.tar.gz'
 
+  def __init__(self, weights_path=None, trained_model=None):
     super().__init__(weights_path=weights_path, trained_model=trained_model)
     self.crop_size = 96
     self.defaults.use_argmax = True
@@ -1301,9 +1304,9 @@ class MSAttention(Attention):
 
   Trained on single-channel images.
   """
-  def __init__(self, weights_path=None, trained_model=None):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/MSAttention.tar.gz'
+  model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/MSAttention.tar.gz'
 
+  def __init__(self, weights_path=None, trained_model=None):
     super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.defaults.use_argmax = False
@@ -1350,9 +1353,10 @@ class MSAttention96(MSAttention):
 
   Trained on single-channel images.
   """
-  def __init__(self, weights_path=None, trained_model=None):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/MSAttention96.tar.gz'
 
+  model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/MSAttention96.tar.gz'
+
+  def __init__(self, weights_path=None, trained_model=None):
     super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.defaults.use_argmax = True
@@ -1367,6 +1371,8 @@ class SimpleCombined(MNModel):
   A simple ensembling method where MN masks from multiple models
   are combined together as a simple union, but with some size filtering
   """
+  model_url = None
+
   def __init__(self, weights_path=None, trained_model=None):
     super().__init__() # There are no weights or trained model to load
 
@@ -1377,10 +1383,8 @@ class SimpleCombined(MNModel):
     self.supplementary_models = [
       MNModel.get_model("MSAttention")
     ]
-
-    self.model_url = None
     
-  def _load_model(self):
+  def _load_model(self, weights_path=None):
     return True
 
   def predict(self, img, skip_opening=None, expand_masks=None, use_argmax=None, area_thresh=250, **kwargs):
@@ -1446,9 +1450,8 @@ class Combined(MNModel):
 
   Trained on the output of the Attention and MSAttention models
   """
+  model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Combined.tar.gz'
   def __init__(self, weights_path=None, trained_model=None):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Combined.tar.gz'
-
     super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.crop_size = 128
