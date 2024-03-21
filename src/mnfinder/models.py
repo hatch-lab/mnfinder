@@ -1,6 +1,5 @@
 import tensorflow as tf
 import tensorflow.keras.layers as nn
-from keras.backend import concatenate
 from tensorflow.keras import Model
 
 # Adapted from 
@@ -91,12 +90,7 @@ class AttentionUNet:
 
     layer = self._attention_block_2d(x=layer, g=up, inter_channel=in_channel // 4, data_format=data_format)
 
-    if data_format == 'channels_first':
-      my_concat = nn.Lambda(lambda x: concatenate([x[0], x[1]], axis=1))
-    else:
-      my_concat = nn.Lambda(lambda x: concatenate([x[0], x[1]], axis=3))
-
-    concat = my_concat([up, layer])
+    concat = nn.Concatenate()([up, layer])
     return concat
 
   def _attention_block_2d(self, x, g, inter_channel, data_format='channels_last'):
