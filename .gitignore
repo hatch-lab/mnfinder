@@ -5,3 +5,4 @@ models/*/*
 models/*.tar.gz
 __pycache__
 dist/*
+.ipynb_checkpoints/
