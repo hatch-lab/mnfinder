@@ -153,7 +153,7 @@ class MNModel:
     return model_name in MNModel.get_available_models()
 
   @staticmethod
-  def get_model(model_name='Attention'):
+  def get_model(model_name='Attention', weights_path=None, trained_model=None):
     """
     Returns an instance of the given model
 
@@ -163,6 +163,10 @@ class MNModel:
     --------
     model_name : str
       The model name. Defaults to the Attention class
+    weights_path : Path|str|None
+      Where to load the weights. If None, will load pretrained weights
+    trained_model : tf.keras.Model|None
+      To substitute an existing neural net model, specify it here
     
     Returns
     --------
@@ -173,7 +177,7 @@ class MNModel:
       raise ModelNotFound("No such MN model: {}".format(model_name))
     try:
       model = globals()[model_name]
-      return model()
+      return model(weights_path=weights_path, trained_model=trained_model)
     except:
       raise ModelNotLoaded("Could not load model: {}".format(model_name))
 
@@ -274,7 +278,7 @@ class MNModel:
       'pred_mn_label': [], # The prediction label
       'exists': [], # If any portion of this prediction overlapped with 1 or more real MN
       'area': [], # The area in square pixels
-      'overlap_proportion': [], # The proportion of overlap between prediction and truths
+      'proportion_true': [], # The proportion of overlap between prediction and truths
       'true_labels': [], # The label IDs of any true MN that overlap
     }
 
@@ -292,45 +296,50 @@ class MNModel:
     }
     # Summary also contains PPV and and recall statistics
 
-    for mn_label in np.unique(true_mn_labels):
-      if mn_label == 0:
+    for true_mn_label in np.unique(true_mn_labels):
+      if true_mn_label == 0:
         continue
 
-      mn_df['true_mn_label'].append(mn_label)
-      if np.sum(intact_mn[(true_mn_labels == mn_label)]) > 0:
+      mn_df['true_mn_label'].append(true_mn_label)
+      if np.sum(intact_mn[(true_mn_labels == true_mn_label)]) > 0:
         mn_df['intact'].append(True)
       else:
         mn_df['intact'].append(False)
 
-      area = np.sum(true_mn_labels[(true_mn_labels == mn_label)])
+      area = np.sum((true_mn_labels == true_mn_label))
       mn_df['area'].append(area)
 
-      if np.sum(mn_labels[(true_mn_labels == mn_label)]) > 0:
+      pred_overlap = np.sum(np.logical_and((true_mn_labels == true_mn_label), ( mn_labels > 0 )))
+      if pred_overlap > 0:
         mn_df['found'].append(True)
         mn_df['proportion_segmented'].append(
-          np.sum(mn_labels[(true_mn_labels == mn_label)])/area
+          pred_overlap/area
         )
-        mn_df['pred_labels'].append(np.unique(mn_labels[(true_mn_labels == mn_label) & (~(mn_labels == 0))]))
+        mn_df['pred_labels'].append(np.unique(mn_labels[(true_mn_labels == true_mn_label) & (mn_labels > 0)]))
       else:
         mn_df['found'].append(False)
         mn_df['proportion_segmented'].append(0.)
         mn_df['pred_labels'].append([])
 
     for mn_label in np.unique(mn_labels):
+      if mn_label == 0:
+        continue
+
       pred_df['pred_mn_label'].append(mn_label)
-      area = np.sum(mn_labels[(mn_labels == mn_label)])
+      area = np.sum((mn_labels == mn_label))
       pred_df['area'].append(area)
 
-      if np.sum(true_mn_labels[(mn_labels == mn_label)]) > 0:
+      true_overlap = np.sum(np.logical_and((mn_labels == mn_label), ( true_mn_labels > 0 )))
+      if true_overlap > 0:
         pred_df['exists'].append(True)
-        mn_df['overlap_proportion'].append(
-          np.sum(true_mn_labels[(mn_labels == mn_label)])/area
+        pred_df['proportion_true'].append(
+          true_overlap/area
         )
-        mn_df['true_labels'].append(np.unique(true_mn_labels[(mn_labels == mn_label) & (~(true_mn_labels == 0))]))
+        pred_df['true_labels'].append(np.unique(true_mn_labels[(mn_labels == mn_label) & (true_mn_labels > 0)]))
       else:
         pred_df['exists'].append(False)
-        mn_df['overlap_proportion'].append(0.)
-        mn_df['true_labels'].append([])
+        pred_df['proportion_true'].append(0.)
+        pred_df['true_labels'].append([])
 
     mn_df = pd.DataFrame(mn_df)
     pred_df = pd.DataFrame(pred_df)
@@ -361,9 +370,16 @@ class MNModel:
 
     return mn_df, pred_df, summary_df
 
-  def __init__(self):
+  def __init__(self, weights_path=None, trained_model=None):
     """
     Constructor
+
+    Parameters
+    --------
+    weights_path : str|Path|None
+      Where the model weights are stored. If None, defaults to models/[model_name]
+    trained_model : tf.keras.Model|None
+      If we wish to supply your own trained model, otherwise it will be loaded
     
     Returns
     --------
@@ -383,9 +399,12 @@ class MNModel:
       opening_radius=1
     )
 
-    self._load_model()
+    if trained_model is not None:
+      self.trained_model = trained_model
+    else:
+      self._load_model(weights_path)
 
-  def _load_model(self, model_path=None):
+  def _load_model(self, weights_path=None):
     """
     Load the trained model weights
 
@@ -394,16 +413,16 @@ class MNModel:
 
     Parameters
     --------
-    model_path : str|Path|None
+    weights_path : str|Path|None
       Where the model weights are stored. If None, defaults to models/[model_name]
     """
-    if model_path is None:
-      model_path = self.models_root / self.__class__.__name__
+    if weights_path is None:
+      weights_path = self.models_root / self.__class__.__name__
     else:
-      model_path = Path(model_path).resolve()
+      weights_path = Path(weights_path).resolve()
 
     model_gzip_path = self.models_root / (self.__class__.__name__ + ".tar.gz")
-    if not model_path.exists():
+    if not weights_path.exists():
       # Try to download
       r = requests.get(self.model_url, allow_redirects=True, stream=True)
 
@@ -1073,10 +1092,10 @@ class LaplaceDeconstruction(MNModel):
 
   This is an Attention UNet trained on these deconstructed images
   """
-  def __init__(self):
+  def __init__(self, weights_path=None, trained_model=None):
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/LaplaceDeconstruction.tar.gz'
 
-    super().__init__()
+    super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.crop_size = 128
     self.bg_max = 0.5
@@ -1240,10 +1259,10 @@ class Attention(MNModel):
 
   Trained on single-channel images + Sobel
   """
-  def __init__(self):
+  def __init__(self, weights_path=None, trained_model=None):
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention.tar.gz'
 
-    super().__init__()
+    super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.crop_size = 128
 
@@ -1262,10 +1281,10 @@ class Attention96(Attention):
 
   Trained on single-channel images + Sobel
   """
-  def __init__(self):
+  def __init__(self, weights_path=None, trained_model=None):
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention96.tar.gz'
 
-    super().__init__()
+    super().__init__(weights_path=weights_path, trained_model=trained_model)
     self.crop_size = 96
     self.defaults.use_argmax = True
 
@@ -1280,10 +1299,10 @@ class MSAttention(Attention):
 
   Trained on single-channel images.
   """
-  def __init__(self):
+  def __init__(self, weights_path=None, trained_model=None):
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/MSAttention.tar.gz'
 
-    super().__init__()
+    super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.defaults.use_argmax = False
 
@@ -1329,10 +1348,10 @@ class MSAttention96(MSAttention):
 
   Trained on single-channel images.
   """
-  def __init__(self):
+  def __init__(self, weights_path=None, trained_model=None):
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/MSAttention96.tar.gz'
 
-    super().__init__()
+    super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.defaults.use_argmax = True
 
@@ -1346,8 +1365,8 @@ class SimpleCombined(MNModel):
   A simple ensembling method where MN masks from multiple models
   are combined together as a simple union, but with some size filtering
   """
-  def __init__(self):
-    super().__init__()
+  def __init__(self, weights_path=None, trained_model=None):
+    super().__init__() # There are no weights or trained model to load
 
     self.crop_size = 128
 
@@ -1425,10 +1444,10 @@ class Combined(MNModel):
 
   Trained on the output of the Attention and MSAttention models
   """
-  def __init__(self):
+  def __init__(self, weights_path=None, trained_model=None):
     self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Combined.tar.gz'
 
-    super().__init__()
+    super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.crop_size = 128
 
