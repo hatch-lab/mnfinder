@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnfinder"
-version = "1.0.0"
+version = "1.0.1"
 authors = [{ name = "Lucian DiPeso", email="ldipeso@uw.edu" }]
 description = "A package for segmenting micronuclei in microscopy images"
 readme = "README.md"
@@ -15,6 +15,7 @@ classifiers = [
   "Operating System :: OS Independent",
 ]
 dependencies = [
+  "appdirs",
   "tensorflow==2.14.0",
   "pandas",
   "numpy",

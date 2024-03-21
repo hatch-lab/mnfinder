@@ -23,6 +23,7 @@ import random
 from PIL import Image
 import albumentations as A
 from datetime import datetime
+from appdirs import AppDirs
 
 from .models import AttentionUNet, MSAttentionUNet
 
@@ -107,10 +108,11 @@ class MNModel:
   train(train_root=Path|str, val_root=Path|str, batch_size=None|int, epochs=100, checkpoint_path=Path|str|None, num_per_image=int|None)
     Build a train a model from scratch
   """
-
-  models_root = (Path(__file__) / "../../../models").resolve()
-  training_root = (Path(__file__) / "../../../training").resolve()
-  testing_root = (Path(__file__) / "../../../testing").resolve()
+  __version__ = "1.0.1"
+  dirs = AppDir("MNFinder", "Hatch-Lab", __version__)
+  models_root = (Path(dirs.user_data_dir) / "models").resolve()
+  training_root = (Path(__file__) / "../training").resolve()
+  testing_root = (Path(__file__) / "../testing").resolve()
 
   @staticmethod
   def get_available_models():

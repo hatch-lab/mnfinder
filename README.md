@@ -102,10 +102,10 @@ Images of arbitrary size will be cropped by a sliding window and segments combin
 `skip_opening=bool`
 : Whether to skip running opening on MN predictions prior to labelling. Many models are improved by removing small 1- or 2-px segments by image opening—erosion following by dilation. Defaults to the model default.
 
-`skip_opening=bool`
+`expand_masks=bool`
 : Whether to expand micronucleus masks by returning the convex hulls of each segment. Defaults to the model default.
 
-`skip_opening=bool`
+`use_argmax=bool`
 : Whether to determine pixel classes by taking the maximum probability. Some models are improved by instead setting a simple threshold on the micronucleus class probability, setting a pixel to the micronucleus class even if the model’s nucleus class probability is higher. If `use_argmax` is `False`, the model will select pixels with a background class > `model.bg_max` and a micronucleus class < `model.fg_min`. Defaults to the model default.
 
 `area_thresh=int|False`
