@@ -25,7 +25,8 @@ dependencies = [
   "docopt",
   "csbdeep",
   "albumentations",
-  "Pillow"
+  "Pillow",
+  "jupyter"
 ]
 keywords = [
   "micronucleus",
