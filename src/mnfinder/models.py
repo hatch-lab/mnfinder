@@ -232,7 +232,218 @@ class MSAttentionUNet(AttentionUNet):
     x3 = nn.UpSampling2D(size=(4,4), data_format=data_format, interpolation='bilinear')(x3)
 
     x = nn.Concatenate()([x1, x2, x3])
+    x = nn.Dropout(0.2)(x)
+    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')(x)
+    
     x = nn.Lambda(lambda x: tf.expand_dims(x, axis=-1))(x)
     x = nn.MaxPooling3D((2,2,3), data_format=data_format)(x)
-    return nn.Lambda(lambda x: tf.squeeze(x, axis=-1))(x)
+    x = nn.Lambda(lambda x: tf.squeeze(x, axis=-1))(x)
+    return x
 
+class SegmenterUNet(AttentionUNet):
+  """
+  Builds a standard U-Net with attention in the up-blocks
+  """
+  def build(self, crop_size, num_input_channels, depth=4):
+    """
+    Build and return the network model
+
+    Input assumes channels are last, with image shapes being
+    (crop_size, crop_size, num_input_channels)
+
+    Parameters
+    --------
+    crop_size : int
+      The width and height of each image
+    num_input_channels : int
+      The number of channels
+    num_output_classes : int
+      The number of output classes
+    depth : int
+      The depth of the neural net
+    
+    Returns
+    --------
+    tf.keras.Model
+      The built model
+    """
+    inputs = nn.Input(( crop_size, crop_size, num_input_channels ))
+    x = inputs
+
+    features = 64
+    skips = []
+    for i in range(depth):
+      x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
+      x = nn.Dropout(0.2)(x)
+      x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
+      skips.append(x)
+      x = nn.MaxPooling2D((2, 2), data_format='channels_last')(x)
+      features *= 2
+
+    # Bottleneck
+    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')(x)
+    x = nn.Dropout(0.2)(x)
+    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')(x)
+
+    hull_features = features
+    hull_decoder = x
+    hull_skips = []
+    for i in reversed(range(depth)):
+      hull_features = hull_features // 2
+      hull_decoder = self._attention_up_and_concat(hull_decoder, skips[i], data_format='channels_last')
+      hull_decoder = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(hull_decoder)
+      hull_decoder = nn.Dropout(0.2)(hull_decoder)
+      hull_decoder = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(hull_decoder)
+      hull_skips.insert(0, hull_decoder)
+    hull_decoder = nn.Dense(units=1)(hull_decoder)
+
+    # seg_features = features
+    # seg_decoder = x
+    # seg_skips = []
+    # for i in reversed(range(depth)):
+    #   seg_features = seg_features // 2
+    #   seg_decoder = self._attention_up_and_concat(seg_decoder, skips[i], data_format='channels_last')
+    #   # seg_decoder = nn.Add()([seg_decoder, hull_skips[i]])
+    #   seg_decoder = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(seg_decoder)
+    #   seg_decoder = nn.Dropout(0.2)(seg_decoder)
+    #   seg_decoder = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(seg_decoder)
+
+    # seg_decoder = nn.Conv2D(num_output_classes, (1, 1), padding='same', data_format='channels_last')(seg_decoder)
+    # seg_decoder = nn.Activation('sigmoid')(seg_decoder)
+
+    # concat_block = nn.Concatenate()([ hull_decoder, seg_decoder ])
+    model = Model(inputs=inputs, outputs=hull_decoder)
+
+    return model
+
+class UNet3(AttentionUNet):
+  """
+  Builds a standard U-Net with attention in the up-blocks
+  """
+  def build(self, crop_size, num_input_channels, num_output_classes=1, depth=4, training=False):
+    """
+    Build and return the network model
+
+    Input assumes channels are last, with image shapes being
+    (crop_size, crop_size, num_input_channels)
+
+    Parameters
+    --------
+    crop_size : int
+      The width and height of each image
+    num_input_channels : int
+      The number of channels
+    num_output_classes : int
+      The number of output classes
+    depth : int
+      The depth of the neural net
+    
+    Returns
+    --------
+    tf.keras.Model
+      The built model
+    """
+    inputs = nn.Input(( crop_size, crop_size, num_input_channels ))
+
+    # Keep number of features constant to reduce training params
+    # per half u-net paper
+    # 0       0 128
+    #  1     1  64
+    #   2   2   32
+    #    3 3    16
+    #     4     8
+
+    features = 128
+
+    # Encoder
+    encoder_blocks = []
+    e1 = self._make_conv_block(inputs, features) # 128x128x64
+    encoder_blocks.append(e1)
+
+    for i in range(1,depth):
+      encoder_blocks.append(nn.MaxPooling2D((2,2))(encoder_blocks[i-1]))
+      encoder_blocks[-1] = self._make_conv_block(encoder_blocks[-1], features)
+    
+    # Decoder
+    # Dual U-Net design
+    # hull_decoder = encoder_blocks[-1]
+    # # hull_features = features
+    # for i in reversed(range(depth-1)):
+    #   # hull_features = hull_features // 2
+    #   hull_decoder = self._attention_up_and_concat(hull_decoder, encoder_blocks[i], data_format='channels_last')
+    #   hull_decoder = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(hull_decoder)
+    #   hull_decoder = nn.Dropout(0.2)(hull_decoder)
+    #   hull_decoder = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(hull_decoder)
+    # hull_decoder = nn.Dense(units=1)(hull_decoder)
+
+    decoder_blocks = []
+    for i in reversed(range(depth-1)):
+      # features = features // 2
+      # Skip connections
+      down_skips = []
+      down_skips.append(self._make_conv_block(encoder_blocks[i], features))
+      for j in range(1,i+1):
+        down_skips.append(nn.MaxPool2D((2**j, 2**j))(encoder_blocks[i-j]))
+        down_skips[-1] = self._make_conv_block(down_skips[-1], features, n=1)
+
+      decoder_skips = []
+      for j in range(1,len(decoder_blocks)):
+        decoder_skips.append(nn.UpSampling2D((2**(j+1),2**(j+1)))(decoder_blocks[j]))
+
+      up_skips = []
+      for j in range(i+1,depth-1):
+        up_skips.append(nn.UpSampling2D((2**(j-i), 2**(j-i)))(encoder_blocks[j]))
+        up_skips[-1] = self._make_conv_block(up_skips[-1], features, n=1)
+
+      if i == depth-2:
+        up_skips.append(nn.UpSampling2D((2,2))(encoder_blocks[-1]))
+      else:
+        up_skips.append(nn.UpSampling2D((2,2))(decoder_blocks[0]))
+        decoder_skips.append(nn.UpSampling2D((2**(depth-i-1),2**(depth-i-1)))(encoder_blocks[-1]))
+
+      # Add instead of concat, per half u-net paper
+      decoder_blocks.insert(0, nn.Add()(down_skips + up_skips + decoder_skips)) 
+      if i == 0:
+        # decoder_blocks[0] = self._make_conv_block(nn.Concatenate()([ hull_decoder, decoder_blocks[0] ]), features, n=1)
+        decoder_blocks[0] = self._make_conv_block(nn.Concatenate()([ decoder_blocks[0] ]), features, n=1)
+        decoder_blocks[0] = self._make_conv_block(decoder_blocks[0], num_output_classes, normalize=False, activation=None, n=1)
+      else:
+        # hull_link = nn.MaxPool2D((2**i, 2**i))(hull_decoder)
+        # decoder_blocks[0] = self._make_conv_block(nn.Concatenate()([ hull_link, decoder_blocks[0] ]), features, n=1)
+        decoder_blocks[0] = self._make_conv_block(nn.Concatenate()([ decoder_blocks[0] ]), features, n=1)
+        decoder_blocks[0] = self._make_conv_block(decoder_blocks[0], features, n=1)
+
+    decoder_blocks[0] = nn.Activation('softmax', name="Decoder-out-0")(decoder_blocks[0])
+
+    # outs = [ nn.Concatenate(name="Out-0")([ hull_decoder, decoder_blocks[0] ]) ]
+    outs = [ decoder_blocks[0] ]
+    
+    if training:
+      for i in range(1,depth-1):
+        decoder_blocks[i] = self._make_conv_block(decoder_blocks[i], num_output_classes, normalize=False, activation=None, n=1)
+        decoder_blocks[i] = nn.UpSampling2D((2**i, 2**i), interpolation='bilinear')(decoder_blocks[i])
+        decoder_blocks[i] = nn.Activation('softmax', name='Decoder-out-{}'.format(i))(decoder_blocks[i])
+        # outs.append(nn.Concatenate(name="Out-{}".format(i))([ hull_decoder, decoder_blocks[i] ]))
+        outs.append(decoder_blocks[i])
+      
+      encoder_blocks[-1] = self._make_conv_block(encoder_blocks[-1], num_output_classes, normalize=False, activation=None, n=1)
+      encoder_blocks[-1] = nn.UpSampling2D(( 2**(depth-1), 2**(depth-1) ), interpolation='bilinear')(encoder_blocks[-1])
+      encoder_blocks[-1] = nn.Activation('softmax', name="Encoder-out")(encoder_blocks[-1])
+      # outs.append(nn.Concatenate(name="Out-3")([ hull_decoder, encoder_blocks[-1] ]))
+      outs.append(encoder_blocks[-1])
+
+    model = Model(inputs=inputs, outputs=outs)
+
+    return model
+
+  def _make_conv_block(self, x, features, normalize=True, activation='relu', n=2, data_format='channels_last'):
+    for i in range(n):
+      x = nn.Conv2D(features, (3, 3), activation=None, padding='same', data_format=data_format)(x)
+      if n > 1:
+        x = nn.Dropout(0.2)(x)
+      if normalize:
+        x = nn.BatchNormalization()(x)
+      if activation is not None:
+        x = nn.Activation(activation)(x)
+
+    return x

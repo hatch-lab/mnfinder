@@ -25,7 +25,7 @@ import albumentations as A
 from datetime import datetime
 from platformdirs import PlatformDirs
 
-from .models import AttentionUNet, MSAttentionUNet
+from .models import AttentionUNet, MSAttentionUNet, UNet3
 
 __version__ = "1.0.1"
 dirs = PlatformDirs("MNFinder", "Hatch-Lab", __version__)
@@ -135,7 +135,8 @@ class MNModel:
       'Attention96',
       'MSAttention',
       'MSAttention96',
-      'LaplaceDeconstruction'
+      'LaplaceDeconstruction',
+      'UNet3Model'
     ]
     return available_models
   
@@ -375,6 +376,12 @@ class MNModel:
 
     return mn_df, pred_df, summary_df
 
+  crop_size = 128
+  oversample_size = crop_size//4
+  batch_size = 64
+  bg_max = 0.5
+  fg_min = 0.2
+
   def __init__(self, weights_path=None, trained_model=None):
     """
     Constructor
@@ -390,13 +397,6 @@ class MNModel:
     --------
     MNModel
     """
-    self.crop_size = 96
-    self.oversample_size = self.crop_size//4
-    self.batch_size = 64
-    self.name = self.__class__.__name__
-    self.bg_max = 0.5
-    self.fg_min = 0.2
-
     self.defaults = MNModelDefaults(
       skip_opening=False, 
       expand_masks=True, 
@@ -451,13 +451,16 @@ class MNModel:
 
       model_gzip_path.unlink()
 
-    warnings.filterwarnings("ignore", message=".*Unable to restore custom metric.*")
-    self.trained_model = tf.keras.models.load_model(
-      str(self._get_path()), 
-      custom_objects=self._get_custom_metrics(),
-      compile=False
-    )
-    warnings.resetwarnings()
+    # warnings.filterwarnings("ignore", message=".*Unable to restore custom metric.*")
+    self.trained_model = self._build_model()
+    self.trained_model.load_weights(self._get_path())
+
+    # tf.keras.models.load_model(
+    #   str(self._get_path()), 
+    #   custom_objects=self._get_custom_metrics(),
+    #   compile=False
+    # )
+    # warnings.resetwarnings()
   
   def predict(self, img, skip_opening=None, expand_masks=None, use_argmax=None, area_thresh=250, **kwargs):
     """
@@ -591,10 +594,10 @@ class MNModel:
     list
       A list of dictionaries containing the crop and coordinates
     """
-    channels = []
+    channels = [ self.normalize_image(img[...,0]) ]
     edges = []
-    for channel in range(img.shape[2]):
-      channels.append(self.normalize_image(img[...,channel]))
+    # for channel in range(img.shape[2]):
+    #   channels.append(self.normalize_image(img[...,channel]))
 
     edges = [ sobel(x) for x in channels ]
     edges = [ self.normalize_image(x) for x in edges ]
@@ -936,6 +939,9 @@ class MNModel:
       'mean_iou_with_nuc': mean_iou_with_nuc
     }
 
+    if name is None:
+      return metrics
+
     return metrics[name]
 
   def _get_custom_metrics(self):
@@ -1085,7 +1091,6 @@ class MNModel:
   def _get_loss_weights(self):
     return [ 1.0, 10.0, 800.0 ]
 
-
 class LaplaceDeconstruction(MNModel):
   """
   Laplace pyramids can separate an image into different frequencies, with each frequency 
@@ -1097,15 +1102,14 @@ class LaplaceDeconstruction(MNModel):
 
   This is an Attention UNet trained on these deconstructed images
   """
+  model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/LaplaceDeconstruction.tar.gz'
+
+  crop_size = 128
+  bg_max = 0.5
+  fg_min = 0.1
+
   def __init__(self, weights_path=None, trained_model=None):
-    self.model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/LaplaceDeconstruction.tar.gz'
-
     super().__init__(weights_path=weights_path, trained_model=trained_model)
-
-    self.crop_size = 128
-    self.bg_max = 0.5
-    self.fg_min = 0.1
-   
     self.defaults.use_argmax = False
     self.defaults.opening_radius = 2
 
@@ -1266,15 +1270,13 @@ class Attention(MNModel):
   """
   model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention.tar.gz'
 
+  crop_size = 128
+  bg_max = 0.59
+  fg_min = 0.24
+
   def __init__(self, weights_path=None, trained_model=None):
     super().__init__(weights_path=weights_path, trained_model=trained_model)
-
-    self.crop_size = 128
-
     self.defaults.use_argmax = False
-
-    self.bg_max = 0.59
-    self.fg_min = 0.24
 
   def _build_model(self):
     factory = AttentionUNet()
@@ -1288,13 +1290,14 @@ class Attention96(Attention):
   """
   model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention96.tar.gz'
 
+  crop_size = 96
+  bg_max = 0.59
+  fg_min = 0.24
+
   def __init__(self, weights_path=None, trained_model=None):
     super().__init__(weights_path=weights_path, trained_model=trained_model)
-    self.crop_size = 96
+    self.
     self.defaults.use_argmax = True
-
-    self.bg_max = 0.59
-    self.fg_min = 0.24
 
 class MSAttention(Attention):
   """
@@ -1306,14 +1309,14 @@ class MSAttention(Attention):
   """
   model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/MSAttention.tar.gz'
 
+  bg_max = 0.6
+  fg_min = 0.3
+
   def __init__(self, weights_path=None, trained_model=None):
     super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.defaults.use_argmax = False
-
-    self.bg_max = 0.6
-    self.fg_min = 0.3
-    self.defaults.opening_radius = 2
+    self.defaults.opening_radius = 1
 
   def _get_mn_predictions(self, img):
     tensors = []
@@ -1356,14 +1359,14 @@ class MSAttention96(MSAttention):
 
   model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/MSAttention96.tar.gz'
 
+  crop_size = 96
+  bg_max = 0.6
+  fg_min = 0.25
+
   def __init__(self, weights_path=None, trained_model=None):
     super().__init__(weights_path=weights_path, trained_model=trained_model)
 
     self.defaults.use_argmax = True
-
-    self.crop_size = 96
-    self.bg_max = 0.6
-    self.fg_min = 0.25
     self.defaults.opening_radius = 1
 
 class SimpleCombined(MNModel):
@@ -1373,10 +1376,10 @@ class SimpleCombined(MNModel):
   """
   model_url = None
 
+  crop_size = 128
+
   def __init__(self, weights_path=None, trained_model=None):
     super().__init__() # There are no weights or trained model to load
-
-    self.crop_size = 128
 
     # The base model will be used to generate
     self.base_model = MNModel.get_model("Attention")
@@ -1463,8 +1466,8 @@ class Combined(MNModel):
 
     # self.model_url = None
     self.defaults.use_argmax = False
-    self.bg_max = 0.55
-    self.fg_min = 0.27
+    self.bg_max = 0.6
+    self.fg_min = 0.16
 
   def _get_mn_predictions(self, img):
     """
@@ -1537,6 +1540,63 @@ class Combined(MNModel):
 
       return data_points
     return TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment, post_hooks=[ post_process ])
+
+class UNet3Model(Attention):
+  model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/UNet3Model.tar.gz'
+
+  crop_size = 128
+  bg_max = 0.59
+  fg_min = 0.24
+
+  def __init__(self, weights_path=None, trained_model=None):
+    super().__init__(weights_path=weights_path, trained_model=trained_model)
+
+    self.defaults.use_argmax = True
+
+  def _build_model(self, training=False):
+    factory = UNet3()
+    return factory.build(self.crop_size, 2, num_output_classes=3, depth=4, training=training)
+
+  @staticmethod
+  def _get_model_metric(name):
+    metrics = Attention._get_model_metric(None)
+    def loss_iou(y_true, y_pred, smooth=1):
+      return 1-metrics['mean_iou'](y_true, y_pred, smooth)
+
+    def ssim_loss(y_true, y_pred):
+      # y_true_f = tf.squeeze(y_true, axis=3)
+      y_true_f = tf.cast(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=3), dtype=tf.float32)
+      # ssim_value = tf.image.ssim(tf.expand_dims(y_true[...,1], axis=-1), tf.expand_dims(y_pred[...,1], axis=-1), max_val=1)
+      ssim_value = tf.image.ssim(y_true_f, y_pred, max_val=1)
+      return K.mean(1 - ssim_value, axis=0)
+
+    def hybrid_loss(y_true, y_pred):
+      f_loss = metrics['sigmoid_focal_crossentropy'](y_true, y_pred)
+      ms_ssim_loss = ssim_loss(y_true, y_pred)
+      iou_loss = loss_iou(y_true, y_pred)
+      return f_loss+ms_ssim_loss+iou_loss
+
+    metrics['hybrid_loss'] = hybrid_loss
+    metrics['ssim_loss'] = ssim_loss
+
+    if name is None:
+      return metrics
+
+    return metrics[name]
+
+  def _get_custom_metrics(self):
+    return { 
+      'sigmoid_focal_crossentropy': self._get_model_metric('sigmoid_focal_crossentropy'), 
+      'ssim_loss': self._get_model_metric('ssim_loss'),
+      'mean_iou': self._get_model_metric('mean_iou'),
+      'mean_iou_with_nuc': self._get_model_metric('mean_iou_with_nuc')
+    }
+
+  def _get_loss_function(self):
+    return self._get_model_metric('hybrid_loss')
+
+  def _get_loss_weights(self):
+    return None
 
 class TrainingDataGenerator:
   """
@@ -1934,7 +1994,6 @@ class TFData(Sequence):
         break
 
     return np.array(batch_x), np.array(batch_y)
-
 
 class IncorrectDimensions(Exception):
   "Images must be (x,y,c) or (x,y)"
