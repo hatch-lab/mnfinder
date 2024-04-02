@@ -7,7 +7,7 @@ import json
 from skimage.filters import sobel
 from skimage.measure import regionprops_table, label
 from skimage.morphology import disk, binary_opening, opening, binary_erosion, area_opening, binary_closing, convex_hull_image
-from skimage.exposure import rescale_intensity, adjust_gamma
+from skimage.exposure import rescale_intensity, adjust_gamma, adjust_sigmoid
 from skimage.color import label2rgb
 from skimage.segmentation import clear_border
 import pandas as pd
@@ -68,8 +68,6 @@ class MNModel:
     The amount of overlap between crops when scanning across an image
   batch_size : int
     Batch size for running predictions
-  name : str
-    The name of this model
   bg_max : float
     If not using argmax to decide pixel classes, the maximum threshold
     a pixel can have for class 0 and still be considered a MN (class 2)
@@ -135,8 +133,7 @@ class MNModel:
       'Attention96',
       'MSAttention',
       'MSAttention96',
-      'LaplaceDeconstruction',
-      'UNet3Model'
+      'LaplaceDeconstruction'
     ]
     return available_models
   
@@ -204,6 +201,7 @@ class MNModel:
     np.array
       Scaled using cbsdeep.normalize, and converted to np.float64
     """
+    # return normalize(adjust_sigmoid(img, cutoff=0.5, gain=5), 4, 99, dtype=np.float64)
     return normalize(img, 4, 99, dtype=np.float64)
 
   @staticmethod
@@ -419,14 +417,14 @@ class MNModel:
     Parameters
     --------
     weights_path : str|Path|None
-      Where the model weights are stored. If None, defaults to models/[model_name]
+      Where the model weights are stored. If None, defaults to models/[model_name]/final.weights.h5
     """
     if weights_path is None:
-      weights_path = self.models_root / self.__class__.__name__
+      weights_path = self.models_root / type(self).__name__
     else:
       weights_path = Path(weights_path).resolve()
 
-    model_gzip_path = self.models_root / (self.__class__.__name__ + ".tar.gz")
+    model_gzip_path = self.models_root / (type(self).__name__ + ".tar.gz")
     if not weights_path.exists():
       # Try to download
       r = requests.get(self.model_url, allow_redirects=True, stream=True)
@@ -437,7 +435,7 @@ class MNModel:
 
       total_size = int(int(r.headers.get('Content-Length', 0))/(1024*1024))
       with open(model_gzip_path, 'wb') as f:
-        pbar = tqdm(total=total_size, desc="Fetching " + self.__class__.__name__, unit="MiB", bar_format='{l_bar}{bar}|{n:0.2f}/{total_fmt}[{elapsed}<{remaining},{rate_fmt}{postfix}]')
+        pbar = tqdm(total=total_size, desc="Fetching " + type(self).__name__, unit="MiB", bar_format='{l_bar}{bar}|{n:0.2f}/{total_fmt}[{elapsed}<{remaining},{rate_fmt}{postfix}]')
         for chunk in r.iter_content(chunk_size=8192):
           if chunk:
             f.write(chunk)
@@ -451,16 +449,8 @@ class MNModel:
 
       model_gzip_path.unlink()
 
-    # warnings.filterwarnings("ignore", message=".*Unable to restore custom metric.*")
     self.trained_model = self._build_model()
-    self.trained_model.load_weights(self._get_path())
-
-    # tf.keras.models.load_model(
-    #   str(self._get_path()), 
-    #   custom_objects=self._get_custom_metrics(),
-    #   compile=False
-    # )
-    # warnings.resetwarnings()
+    self.trained_model.load_weights(self._get_path() / "final.weights.h5")
   
   def predict(self, img, skip_opening=None, expand_masks=None, use_argmax=None, area_thresh=250, **kwargs):
     """
@@ -972,34 +962,36 @@ class MNModel:
     --------
     Path
     """
-    return MNModel.models_root / self.name
+    return MNModel.models_root / type(self).__name__
 
-  def train(self, train_path=None, val_path=None, batch_size=None, epochs=100, checkpoint_path=None, num_per_image=180, save_weights=True, save_path=None):
+  def train(self, train_path=None, val_path=None, batch_size=None, epochs=100, checkpoint_path=None, num_per_image=180, save_weights=True, save_path=None, load_weights=None):
     """
     Train a new model from scratch
 
     Parameters
-      --------
-      train_path : Path|str|None
-        Path to training data root. If None, will use this package's training data.
-      val_path : Path|str
-        Path to validation data root. If None, will use this package's training data.
-      batch_size : int|None
-        Training batch size. If None, will default to self.batch_size
-        (the prediction batch size)
-      epochs : int
-        The number of training epochs
-      checkpoint_path : Path|str|None
-        Where to save checkpoints during training, if not None
-      num_per_image : int|None
-        The number of crops to return per image. If None, will default to
-        [img_width]//crop_size * [[img_height]]//crop_size. Because crops
-        are randomly positioned and can be randomly augmented, more crops
-        can be extracted from a given image than otherwise.
-      save_weights : bool
-        Whether to save the model weights
-      save_path : str|Path|None
-        Where to save model weights. If None, will default to modesl/[model_name]
+    --------
+    train_path : Path|str|None
+      Path to training data root. If None, will use this package's training data.
+    val_path : Path|str
+      Path to validation data root. If None, will use this package's training data.
+    batch_size : int|None
+      Training batch size. If None, will default to self.batch_size
+      (the prediction batch size)
+    epochs : int
+      The number of training epochs
+    checkpoint_path : Path|str|None
+      Where to save checkpoints during training, if not None
+    num_per_image : int|None
+      The number of crops to return per image. If None, will default to
+      [img_width]//crop_size * [[img_height]]//crop_size. Because crops
+      are randomly positioned and can be randomly augmented, more crops
+      can be extracted from a given image than otherwise.
+    save_weights : bool
+      Whether to save the model weights
+    save_path : str|Path|None
+      Where to save model weights. If None, will default to modesl/[model_name]
+    load_weights : str|Path|None
+      If weights should be loaded prior to training, weights at the path specified by load_weights will be used
 
     Returns
     --------
@@ -1021,13 +1013,15 @@ class MNModel:
     validator = self._get_trainer(val_path, batch_size, num_per_image, augment=False)
 
     if checkpoint_path is not None:
-      checkpoint_path = Path(checkpoint_path) / (self.name + "-" + datetime.today().strftime('%Y-%m-%d') + "-{epoch:04d}.ckpt")
+      checkpoint_path = Path(checkpoint_path) / (type(self).__name__ + "-" + datetime.today().strftime('%Y-%m-%d') + "-{epoch:04d}.ckpt")
 
     metrics = self._get_custom_metrics()
     metric_funs = [ fun for k,fun in metrics.items() if k != "K" ]
     metric_funs.append("accuracy")
 
     model = self._build_model()
+    if load_weights is not None:
+      model.load_weights(load_weights)
     model.compile(
       optimizer=self._get_optimizer(),
       loss=self._get_loss_function(),
@@ -1070,25 +1064,76 @@ class MNModel:
 
     if save_weights:
       if save_path is None:
-        save_path = self.models_root / self.__class__.__name__
+        save_path = self.models_root / type(self).__name__ / "final.weights.h5"
 
-      model.save(str(save_path))
+      model.save_weights(str(save_path))
 
     return model, model_history
 
   def _build_model(self):
+    """
+    Build the model
+    
+    Returns
+    --------
+    tf.keras.models.Model
+    """
     raise MethodNotImplemented("I don't know how to build a model")
 
   def _get_trainer(self, data_path, batch_size, num_per_image, augment=True):
+    """
+    Return a trainer
+
+    Parameters
+    --------
+    data_path : Path|str|None
+      The path to the data sets
+    batch_size : int
+      Training batch size
+    num_per_image : int
+      The number of crops to return per training image
+    augment : bool
+      Whether to use image augmentation
+
+    Returns
+    --------
+    tf.keras.utils.Sequence
+    """
     return TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment)
 
   def _get_optimizer(self, lr=5e-4):
+    """
+    Return the keras optimizer to use for training
+
+    Parameters
+    --------
+    lr : float
+      Initial learning rate
+
+    Returns
+    --------
+    tf.keras.optimizers.Optimizer
+    """
     return tf.keras.optimizers.Adam(lr)
 
   def _get_loss_function(self):
+    """
+    Return the keras loss function to use
+
+    Returns
+    --------
+    fun
+    """
     return self._get_model_metric('sigmoid_focal_crossentropy')
 
   def _get_loss_weights(self):
+    """
+    Return the loss weights to use
+
+    Returns
+    --------
+    list|None
+    """
     return [ 1.0, 10.0, 800.0 ]
 
 class LaplaceDeconstruction(MNModel):
@@ -1296,12 +1341,12 @@ class Attention96(Attention):
 
   def __init__(self, weights_path=None, trained_model=None):
     super().__init__(weights_path=weights_path, trained_model=trained_model)
-    self.
+
     self.defaults.use_argmax = True
 
 class MSAttention(Attention):
   """
-  An attention unit with an additional multi-scale modules on the front of each down block in the encoder.
+  An attention unet with an additional multi-scale modules on the front of each down block in the encoder.
 
   This performs convolutions at different resolutions and then runs MaxPooling on the concatenated results.
 
@@ -1521,8 +1566,8 @@ class Combined(MNModel):
     return coords, dataset, expanded
 
   def _build_model(self):
-    model = AttentionUNet(self.crop_size, 2, 3)
-    return model
+    factory = AttentionUNet()
+    return factory.build(self.crop_size, 2, 2)
 
   def _get_trainer(self, data_path, batch_size, num_per_image, augment=True):
     def post_process(data_points):
@@ -1967,7 +2012,24 @@ class TrainingDataGenerator:
     return mask
 
 class TFData(Sequence):
-  def __init__(self, crop_size, data_path, batch_size, num_per_image=None, **kwargs):
+  """
+  Provides training and validation data during training
+  """
+  def __init__(self, crop_size, data_path, batch_size, num_per_image, **kwargs):
+    """
+    Load a TrainingDataGenerator class
+
+    Parameters
+    --------
+    crop_size : int
+      Crop size
+    data_path : Path|str
+      Path to data sets
+    batch_size : int
+      Batch size for training
+    num_per_image : int
+      The number of crops to generate / image
+    """
     self.dg = TrainingDataGenerator(
       crop_size,
       data_path,
@@ -1982,6 +2044,19 @@ class TFData(Sequence):
     return self.num_images*self.num_per_image
 
   def __getitem__(self, idx):
+    """
+    Return a batch of training data
+
+    Parameters
+    --------
+    idx : int
+      The index of the batch to return
+    
+    Returns
+    --------
+    np.array, np.array
+      The training data and ground truth as arrays
+    """
     batch_x = []
     batch_y = []
 

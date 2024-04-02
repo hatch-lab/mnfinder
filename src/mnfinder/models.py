@@ -190,7 +190,7 @@ class MSAttentionUNet(AttentionUNet):
 
     for i in reversed(range(1,depth)):
       features = features // 2
-      x = self.attention_up_and_concat(x, skips[i-1], data_format='channels_last')
+      x = self._attention_up_and_concat(x, skips[i-1], data_format='channels_last')
       x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
       x = nn.Dropout(0.2)(x)
       x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
