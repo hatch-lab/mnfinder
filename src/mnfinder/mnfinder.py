@@ -4,12 +4,14 @@ import tensorflow as tf
 import tensorflow.keras.backend as K
 from tensorflow.keras.utils import Sequence
 import json
-from skimage.filters import sobel
+from skimage.filters import sobel, threshold_li, threshold_yen
+from skimage.feature import peak_local_max
 from skimage.measure import regionprops_table, label
-from skimage.morphology import disk, binary_opening, opening, binary_erosion, area_opening, binary_closing, convex_hull_image
+from skimage.morphology import disk, binary_opening, convex_hull_image, skeletonize
 from skimage.exposure import rescale_intensity, adjust_gamma, adjust_sigmoid
 from skimage.color import label2rgb
 from skimage.segmentation import clear_border
+from scipy import spatial
 import pandas as pd
 import numpy as np
 import cv2
@@ -24,10 +26,11 @@ from PIL import Image
 import albumentations as A
 from datetime import datetime
 from platformdirs import PlatformDirs
+import inspect
 
-from .models import AttentionUNet, MSAttentionUNet, UNet3
+from .models import AttentionUNet, MSAttentionUNet, SegmenterUNet
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 dirs = PlatformDirs("MNFinder", "Hatch-Lab", __version__)
 Path(dirs.user_data_dir).parent.mkdir(exist_ok=True)
 Path(dirs.user_data_dir).mkdir(exist_ok=True)
@@ -64,8 +67,8 @@ class MNModel:
     Where testing data is stored
   crop_size : int
     The input width and height of the model
-  oversample_size : int
-    The amount of overlap between crops when scanning across an image
+  oversample_ratio : float
+    The amount of overlap between crops when scanning across an image, as a proportion of crop_size
   batch_size : int
     Batch size for running predictions
   bg_max : float
@@ -112,8 +115,9 @@ class MNModel:
     Build a train a model from scratch
   """
   models_root = (Path(dirs.user_data_dir) / "models").resolve()
-  training_root = (Path(__file__) / "../training").resolve()
-  testing_root = (Path(__file__) / "../testing").resolve()
+  training_root = (Path(__file__) / "../training-data").resolve()
+  validation_root = (Path(__file__) / "../validation-data").resolve()
+  testing_root = (Path(__file__) / "../test-data").resolve()
 
   @staticmethod
   def get_available_models():
@@ -126,15 +130,21 @@ class MNModel:
     --------
     list
     """
-    available_models = [ 
-      'Combined',
-      'SimpleCombined',
-      'Attention',
-      'Attention96',
-      'MSAttention',
-      'MSAttention96',
-      'LaplaceDeconstruction'
-    ]
+    available_models = [ x for x in inspect.getmembers(sys.modules[__name__], inspect.isclass) if issubclass(x[1], MNModel) ]
+    return available_models
+
+  @staticmethod
+  def get_available_segmenters():
+    """
+    Return the list of available segmenters
+
+    Static method
+
+    Returns
+    --------
+    list
+    """
+    available_models = [ x for x in inspect.getmembers(sys.modules[__name__], inspect.isclass) if issubclass(x[1], MNSegmenter) ]
     return available_models
   
   @staticmethod
@@ -375,12 +385,12 @@ class MNModel:
     return mn_df, pred_df, summary_df
 
   crop_size = 128
-  oversample_size = crop_size//4
+  oversample_ratio = 0.25
   batch_size = 64
   bg_max = 0.5
   fg_min = 0.2
 
-  def __init__(self, weights_path=None, trained_model=None):
+  def __init__(self, weights_path=None, trained_model=None, segmenter_name='DistSegmenter'):
     """
     Constructor
 
@@ -390,6 +400,8 @@ class MNModel:
       Where the model weights are stored. If None, defaults to models/[model_name]
     trained_model : tf.keras.Model|None
       If we wish to supply your own trained model, otherwise it will be loaded
+    segmenter_name : str|None
+      If a segmentation model should be loaded as well
     
     Returns
     --------
@@ -406,6 +418,11 @@ class MNModel:
       self.trained_model = trained_model
     else:
       self._load_model(weights_path)
+
+    if segmenter_name is not None and segmenter_name != type(self).__name__:
+      self.segmenter = MNModel.get_model(segmenter_name)
+    else:
+      self.segmenter = None
 
   def _load_model(self, weights_path=None):
     """
@@ -450,7 +467,7 @@ class MNModel:
       model_gzip_path.unlink()
 
     self.trained_model = self._build_model()
-    self.trained_model.load_weights(self._get_path() / "final.weights.h5")
+    self.trained_model.load_weights(self._get_path() / "final.weights.h5", skip_mismatch=True, by_name=True)
   
   def predict(self, img, skip_opening=None, expand_masks=None, use_argmax=None, area_thresh=250, **kwargs):
     """
@@ -497,42 +514,133 @@ class MNModel:
     if img.shape[0] < self.crop_size or img.shape[1] < self.crop_size:
       raise ValueError("Image is smaller than minimum size of {}x{}".format(self.crop_size, self.crop_size))
 
-    coords, dataset, predictions = self._get_mn_predictions(img)
+    nucleus_pixels, mn_pixels, classifier_output = self._run_pixel_classifier(img)
+    nucleus_labels, mn_labels, mn_nuc_labels, segmenter_output = self._run_segmenter(img, nucleus_pixels, mn_pixels)
+
+    return nucleus_labels, mn_labels, mn_nuc_labels
+
+  def _run_pixel_classifier(self, img):
+    classification_output = self._get_field_predictions(img)
+
+    field_classes = np.argmax(field_output[...,0:3], axis=-1).astype(np.uint8)
+    nucleus_pixels = (field_classes == 1).astype(np.uint8)
+    if use_argmax:
+      mn_pixels = (field_classes == 2).astype(np.uint8)
+    else:
+      mn_pixels = ((field_classes[...,0] < self.bg_max) & (field_classes[...,2] > self.fg_min)).astype(np.uint8)
+
+    inner_nucleus_labels = clear_border(nucleus_pixels)
+    inner_nucleus_labels = label(inner_nucleus_labels)
+
+    if area_thresh is not False and area_thresh > 0:
+      possible_mn_info = pd.DataFrame(regionprops_table(inner_nucleus_labels, properties=('label', 'area')))
+      switch_labels = possible_mn_info['label'].loc[(possible_mn_info['area'] < area_thresh)]
+      mn_pixels[np.isin(inner_nucleus_labels, switch_labels)] = 1
+      nucleus_pixels[np.isin(inner_nucleus_labels, switch_labels)] = 0
+
+    if not skip_opening:
+      mn_pixels = binary_opening(mn_pixels, footprint=disk(self.defaults.opening_radius)).astype(np.uint8)
+    mn_pixels = clear_border(mn_pixels)
+
+    if expand_masks:
+      mn_pixels = self._expand_masks(mn_pixels)
+
+    nucleus_pixels[mn_pixels > 0] = 0
+
+    return nucleus_pixels, mn_pixels, field_output
+
+  def _run_segmenter(self, img, nucleus_pixels, mn_pixels):
+    field_output = self._get_field_predictions(img, 'segment')
+
+    # Watershed
+    distances = field_output[...,1]
+    bin_distances = np.zeros_like(distances).astype(np.uint8)
+    bin_distances[distances > threshold_li(distances)] = 1
+    bin_distances = binary_dilation(bin_distances, disk(8))
+
+    edges = field_output[...,2]*binary_dilation(bin_distances, disk(1))
+
+    combined = edges-distances
+    centroids = peak_local_max(-combined, footprint=disk(10), labels=bin_distances)
+
+    markers = np.zeros(distances.shape, dtype=bool)
+    markers[tuple(centroids.T)] = True
+    markers = label(markers)
+
+    labels = watershed(combined, markers, mask=binary_mask)
+
+    # Merge labels that are bounded with no predicted edges
+    edge_skeleton = np.zeros(( field_output.shape[0], field_output.shape[1] ), dtype=bool)
+    edge_skeleton[edges > threshold_yen(edges)] = 1
+    edge_skeleton = binary_dilation(skeletonize(edge_skeleton), disk(1))
+
+    merging = True
+    merge_count = 0
+    while merging:
+      if merge_count > 100:
+        break
+
+      merge_count += 1
+
+      boundaries = find_boundaries(labels, connectivity=2, mode='outer')
+      boundaries[(labels == 0)] = 0
+      boundaries[(edge_skeleton > 0)] = 0
+      boundaries = label(boundaries)
+      merging = False
+
+      for b_label in np.unique(boundaries):
+        if b_label == 0:
+          continue
+
+        to_merge, counts = np.unique(labels[boundaries == b_label], return_counts=True)
+        to_merge = to_merge[counts > 10]
+        if len(to_merge) < 2:
+          continue
+
+        labels[np.isin(labels, to_merge)] = to_merge[0]
+        merging = True
+        break
+
+    nucleus_labels = labels.copy()
+    nucleus_labels[~nucleus_pixels] = 0
+
+    mn_nuc_labels = labels.copy()
+    mn_nuc_labels[~mn_pixels] = 0
+
+    mn_labels = label(mn_pixels)
+
+    # Find any MN_Nuc links where there is no nuc label
+    orphan_mn = np.setdiff1d(mn_nuc_labels, nucleus_labels)
+    orphan_mn_labels = mn_labels.copy()
+    orphan_mn_labels[~np.isin(mn_nuc_labels, orphan_mn)] = 0
+    if len(np.unique(orphan_mn_labels)) > 1:
+      nuc_info = regionprops_table(nucleus_labels, properties=('label', 'centroid'))
+      orphan_info = regionprops_table(orphan_mn_labels, properties=('label', 'centroid'))
+
+      # Find nearest nuc and relabel
+      nuc_tree = spatial.KDTree(list(zip(nuc_info['centroid-1'], nuc_info['centroid-0'])))
+      for i,x in enumerate(orphan_info['centroid-1']):
+        y = orphan_info['centroid-0'][i]
+        res = nuc_tree.query([ x, y ], k=1)
+        mn_nuc_labels[orphan_mn_labels == orphan_info['label'][i]] = nuc_info['label'][res[1]]
+
+    nucleus_labels = clear_border(nucleus_labels)
+    mn_labels = clear_border(mn_labels)
+    mn_nuc_labels = clear_border(mn_nuc_labels)
+
+    return nucleus_labels, mn_labels, mn_nuc_labels, field_output
+
+  def _get_field_predictions(self, img, model='pixel'):
+    coords, dataset, predictions = self._get_mn_predictions(img, model)
     num_channels = predictions[0].shape[2]
     field_output = np.zeros(( img.shape[0], img.shape[1], num_channels ), dtype=np.float64)
 
     for idx, batch in enumerate(dataset):
       field_output = self._blend_crop(field_output, predictions[idx], coords[idx])
 
-    field_labels = np.argmax(field_output, axis=-1).astype(np.uint8)
-    nucleus_labels = (field_labels == 1).astype(np.uint8)
-    if use_argmax:
-      mn_labels = (field_labels == 2).astype(np.uint8)
-    else:
-      mn_labels = ((field_output[...,0] < self.bg_max) & (field_output[...,2] > self.fg_min)).astype(np.uint8)
+    return field_output
 
-    nucleus_labels = clear_border(nucleus_labels)
-    nucleus_labels = label(nucleus_labels)
-
-    if area_thresh is not False and area_thresh > 0:
-      possible_mn_info = pd.DataFrame(regionprops_table(nucleus_labels, properties=('label', 'area')))
-      switch_labels = possible_mn_info['label'].loc[(possible_mn_info['area'] < area_thresh)]
-      nucleus_labels[np.isin(nucleus_labels, switch_labels)] = 0
-      mn_labels[np.isin(nucleus_labels, switch_labels)] = 1
-
-    if not skip_opening:
-      mn_labels = binary_opening(mn_labels, footprint=disk(self.defaults.opening_radius)).astype(np.uint8)
-    mn_labels = clear_border(mn_labels)
-    mn_labels = label(mn_labels, connectivity=1)
-
-    if expand_masks and len(np.unique(mn_labels)) > 1:
-      mn_labels = self._expand_masks(mn_labels)
-
-    nucleus_labels[mn_labels > 0] = 0
-
-    return nucleus_labels, mn_labels, field_output
-
-  def _get_mn_predictions(self, img):
+  def _get_mn_predictions(self, img, model='pixel'):
     """
     Crops an image and generates a list of neural net predictions of each
 
@@ -563,7 +671,7 @@ class MNModel:
 
     dataset = tf.data.Dataset.from_tensor_slices(tensors)
     dataset_batchs = dataset.batch(self.batch_size)
-    predictions = self.trained_model.predict(dataset_batchs, verbose = 0)
+    predictions = self.trained_models[model].predict(dataset_batchs, verbose = 0)
 
     return coords, dataset, predictions
 
@@ -615,7 +723,9 @@ class MNModel:
 
     crops = []
 
-    slide_px = self.crop_size-self.oversample_size
+    oversample_size = int(self.crop_size*self.oversample_ratio)
+
+    slide_px = self.crop_size-oversample_size
 
     this_y = 0
     while(this_y <= height):
@@ -671,70 +781,79 @@ class MNModel:
     np.array
       The modified field with the crop blended in
     """
+    # Don't want to modify this in-place
+    crop = crop.copy()
+    
     left   = coords[0]
     right  = coords[1]
     top    = coords[2]
     bottom = coords[3]
+
+    oversample_size = int(self.crop_size*self.oversample_ratio)
     
     # Merge images together
     mask = np.ones(( self.crop_size, self.crop_size ), np.float64)
     # Top feather
     if top > 0:
-      mask[0:self.oversample_size, :] = np.tile(np.linspace(0,1,self.oversample_size), (self.crop_size,1)).T
+      mask[0:oversample_size, :] = np.tile(np.linspace(0,1,oversample_size), (self.crop_size,1)).T
     # Bottom feather
     if bottom < field.shape[0]:
-      mask[self.crop_size-self.oversample_size:self.crop_size, :] = np.tile(np.linspace(1,0,self.oversample_size), (self.crop_size,1)).T
+      mask[self.crop_size-oversample_size:self.crop_size, :] = np.tile(np.linspace(1,0,oversample_size), (self.crop_size,1)).T
     # Left feather
     if left > 0:
-      mask[:, 0:self.oversample_size] = np.tile(np.linspace(0,1,self.oversample_size), (self.crop_size, 1))
+      mask[:, 0:oversample_size] = np.tile(np.linspace(0,1,oversample_size), (self.crop_size, 1))
     # Right feather
     if right < field.shape[1]:
-      mask[:, self.crop_size-self.oversample_size:self.crop_size] = np.tile(np.linspace(1,0,self.oversample_size), (self.crop_size, 1))
+      mask[:, self.crop_size-oversample_size:self.crop_size] = np.tile(np.linspace(1,0,oversample_size), (self.crop_size, 1))
 
     # Top-left
     if top > 0 and left > 0:
-      mask[0:self.oversample_size, 0:self.oversample_size] = np.tile(np.linspace(0,1,self.oversample_size), (self.oversample_size,1)).T*np.tile(np.linspace(0,1,self.oversample_size), (self.oversample_size, 1))
+      mask[0:oversample_size, 0:oversample_size] = np.tile(np.linspace(0,1,oversample_size), (oversample_size,1)).T*np.tile(np.linspace(0,1,oversample_size), (oversample_size, 1))
     # Top-right
     if top > 0 and right < field.shape[1]:
-      mask[0:self.oversample_size, self.crop_size-self.oversample_size:self.crop_size] = np.fliplr(np.tile(np.linspace(0,1,self.oversample_size), (self.oversample_size,1)).T*np.tile(np.linspace(0,1,self.oversample_size), (self.oversample_size, 1)))
+      mask[0:oversample_size, self.crop_size-oversample_size:self.crop_size] = np.fliplr(np.tile(np.linspace(0,1,oversample_size), (oversample_size,1)).T*np.tile(np.linspace(0,1,oversample_size), (oversample_size, 1)))
     # Bottom-left
     if bottom < field.shape[0] and left > 0:
-      mask[self.crop_size-self.oversample_size:self.crop_size, 0:self.oversample_size] = np.fliplr(np.tile(np.linspace(1,0,self.oversample_size), (self.oversample_size,1)).T*np.tile(np.linspace(1,0,self.oversample_size), (self.oversample_size, 1)))
+      mask[self.crop_size-oversample_size:self.crop_size, 0:oversample_size] = np.fliplr(np.tile(np.linspace(1,0,oversample_size), (oversample_size,1)).T*np.tile(np.linspace(1,0,oversample_size), (oversample_size, 1)))
     # Bottom-right
     if bottom < field.shape[0] and right < field.shape[1]:
-      mask[self.crop_size-self.oversample_size:self.crop_size, self.crop_size-self.oversample_size:self.crop_size] = np.tile(np.linspace(1,0,self.oversample_size), (self.oversample_size,1)).T*np.tile(np.linspace(1,0,self.oversample_size), (self.oversample_size, 1))
+      mask[self.crop_size-oversample_size:self.crop_size, self.crop_size-oversample_size:self.crop_size] = np.tile(np.linspace(1,0,oversample_size), (oversample_size,1)).T*np.tile(np.linspace(1,0,oversample_size), (oversample_size, 1))
 
-    for c_idx in range(field.shape[2]):
+    for c_idx in range(crop.shape[2]):
       crop[...,c_idx] *= mask
 
     field[top:bottom, left:right] += crop[0:bottom-top, 0:right-left]
 
     return field
 
-  def _expand_masks(self, mn_labels):
+  def _expand_masks(self, mn_pixels):
     """
     Returns the convex hulls of mn_labels
 
     Parameters
     --------
-    mn_labels : np.array
-      The labeled segmentation results
+    mn_pixels : np.array
+      Img with mn-classed pixels == 1
       
     Returns
     --------
     np.array
       The modified labels
     """
-    new_mn_labels = np.zeros_like(mn_labels)
+    mn_labels = label(mn_pixels, connectivity=1)
+    if len(np.unique(mn_labels)) < 2:
+      return mn_pixels
+
+    new_mn_pixels = np.zeros_like(mn_pixels)
     for mn_label in np.unique(mn_labels):
       if mn_label == 0:
         continue
       img_copy = np.zeros_like(mn_labels, dtype=bool)
       img_copy[mn_labels == mn_label] = True
       img_copy = convex_hull_image(img_copy)
-      new_mn_labels[img_copy] = mn_label
+      new_mn_pixels[img_copy] = 1
 
-    return new_mn_labels
+    return new_mn_pixels
 
   @staticmethod
   def _get_model_metric(name):
@@ -815,8 +934,8 @@ class MNModel:
       if gamma and gamma < 0:
         raise ValueError("Value of gamma should be greater than or equal to zero.")
 
-      y_pred = tf.convert_to_tensor(y_pred)
-      y_true = tf.cast(K.one_hot(tf.cast(y_true, tf.uint8), num_classes=3), dtype=y_pred.dtype)
+      y_pred_f = tf.convert_to_tensor(y_pred[...,0:3])
+      y_true_f = tf.cast(y_true[...,0:3], y_pred_f.dtype)
 
       # Get the cross_entropy for each entry
       ce = K.binary_crossentropy(y_true, y_pred, from_logits=from_logits)
@@ -869,8 +988,9 @@ class MNModel:
       --------
       tensor
       """
-      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=3)[...,1:]), dtype=tf.float32)
-      y_pred_f = K.flatten(tf.cast(y_pred[...,1:], dtype=tf.float32))
+      y_pred_f = K.flatten(tf.cast(y_pred[...,1:3], dtype=tf.float32))
+      y_true_f = K.flatten(tf.cast(y_true[...,1:3], y_pred_f.dtype))
+
       intersection = K.sum(y_true_f * y_pred_f, axis=-1)
       denom = K.sum(y_true_f + y_pred_f, axis=-1)
       return K.mean((2. * intersection / (denom + smooth)))
@@ -892,8 +1012,8 @@ class MNModel:
       --------
       tensor
       """
-      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=3)[...,2]), dtype=tf.float32)
-      y_pred_f = K.flatten(tf.cast(y_pred[...,2:4], dtype=tf.float32))
+      y_pred_f = K.flatten(tf.cast(y_pred[...,2], dtype=tf.float32))
+      y_true_f = K.flatten(tf.cast(y_true[...,2], y_pred_f.dtype))
       intersection = K.sum(y_true_f * y_pred_f, axis=-1)
       union = K.sum(y_true_f + y_pred_f, axis=-1)-intersection
       return (intersection + smooth)/(union + smooth)
@@ -915,8 +1035,8 @@ class MNModel:
       --------
       tensor
       """
-      y_true_f = tf.cast(K.flatten(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=3)[...,1:3]), dtype=tf.float32)
       y_pred_f = K.flatten(tf.cast(y_pred[...,1:3], dtype=tf.float32))
+      y_true_f = K.flatten(tf.cast(y_true[...,1:3], y_pred_f.dtype))
       intersection = K.sum(y_true_f * y_pred_f, axis=-1)
       union = K.sum(y_true_f + y_pred_f, axis=-1)-intersection
       return (intersection + smooth)/(union + smooth)
@@ -946,13 +1066,9 @@ class MNModel:
     dict
       Dictionary of custom metric names and their associated functions
     """
-    return { 
-      'sigmoid_focal_crossentropy_loss': self._get_model_metric('sigmoid_focal_crossentropy_loss'), 
-      'sigmoid_focal_crossentropy': self._get_model_metric('sigmoid_focal_crossentropy'),
-      'mean_iou': self._get_model_metric('mean_iou'),
-      'mean_iou_with_nuc': self._get_model_metric('mean_iou_with_nuc'),
-      'K': tf.keras.backend
-    }
+    metrics = self._get_model_metric(None)
+    metrics['K'] = tf.keras.backend
+    return metrics
 
   def _get_path(self):
     """
@@ -1007,7 +1123,7 @@ class MNModel:
       train_path = self.training_root
 
     if val_path is None:
-      val_path = self.training_root
+      val_path = self.validation_root
 
     trainer = self._get_trainer(train_path, batch_size, num_per_image)
     validator = self._get_trainer(val_path, batch_size, num_per_image, augment=False)
@@ -1476,19 +1592,19 @@ class SimpleCombined(MNModel):
     if use_argmax is None:
       use_argmax = self.defaults.use_argmax
 
-    nucleus_labels, base_mn_labels, field_output = self.base_model.predict(img, skip_opening, expand_masks, use_argmax, area_thresh)
+    nucleus_labels, base_mn_labels, base_mn_nuc_labels, field_output = self.base_model.predict(img, skip_opening, expand_masks, use_argmax, area_thresh)
 
     base_mn_labels = (base_mn_labels != 0).astype(np.uint16)
     for idx,model in enumerate(self.supplementary_models):
-      _, mn_labels, mn_raw = model.predict(img, skip_opening, expand_masks, use_argmax, area_thresh)
+      _, mn_labels, mn_nuc_labels, raw = model.predict(img, skip_opening, expand_masks, use_argmax, area_thresh)
       mn_labels = opening(mn_labels, footprint=disk(2))
+      mn_nuc_labels = opening(mn_nuc_labels, footprint=disk(2))
       mn_info = pd.DataFrame(regionprops_table(mn_labels, properties=('label', 'solidity', 'area')))
       keep_labels = mn_info['label'].loc[(mn_info['area'] < 250)]
-      base_mn_labels[np.isin(mn_labels, keep_labels)] = 1
-      field_output += mn_raw
+      base_mn_labels[~np.isin(mn_labels, keep_labels)] = 0
+      base_mn_nuc_labels[~np.isin(mn_labels, keep_labels)] = 0
 
     nucleus_labels[base_mn_labels != 0] = 0
-    base_mn_labels = label(base_mn_labels, connectivity=1)
     
     return nucleus_labels, base_mn_labels, field_output
   
@@ -1586,56 +1702,43 @@ class Combined(MNModel):
       return data_points
     return TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment, post_hooks=[ post_process ])
 
-class UNet3Model(Attention):
-  model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/UNet3Model.tar.gz'
+class Segmenter(MNModel):
+  model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DistSegmenter.tar.gz'
 
   crop_size = 128
-  bg_max = 0.59
-  fg_min = 0.24
-
-  def __init__(self, weights_path=None, trained_model=None):
-    super().__init__(weights_path=weights_path, trained_model=trained_model)
-
-    self.defaults.use_argmax = True
 
   def _build_model(self, training=False):
-    factory = UNet3()
-    return factory.build(self.crop_size, 2, num_output_classes=3, depth=4, training=training)
+    factory = SegmenterUNet()
+    return factory.build(self.crop_size, 2, num_output_classes=1, depth=4, training=training)
 
   @staticmethod
   def _get_model_metric(name):
-    metrics = Attention._get_model_metric(None)
-    def loss_iou(y_true, y_pred, smooth=1):
-      return 1-metrics['mean_iou'](y_true, y_pred, smooth)
+    def mse_hull(y_true, y_pred):
+      return tf.keras.losses.MSE(y_true[...,1], y_pred[...,1])
 
-    def ssim_loss(y_true, y_pred):
-      # y_true_f = tf.squeeze(y_true, axis=3)
-      y_true_f = tf.cast(K.one_hot(tf.cast(y_true, dtype=tf.uint8), num_classes=3), dtype=tf.float32)
-      # ssim_value = tf.image.ssim(tf.expand_dims(y_true[...,1], axis=-1), tf.expand_dims(y_pred[...,1], axis=-1), max_val=1)
-      ssim_value = tf.image.ssim(y_true_f, y_pred, max_val=1)
-      return K.mean(1 - ssim_value, axis=0)
+    def mse_edge(y_true, y_pred):
+      return tf.keras.losses.MSE(y_true[...,2], y_pred[...,2])
 
     def hybrid_loss(y_true, y_pred):
-      f_loss = metrics['sigmoid_focal_crossentropy'](y_true, y_pred)
-      ms_ssim_loss = ssim_loss(y_true, y_pred)
-      iou_loss = loss_iou(y_true, y_pred)
-      return f_loss+ms_ssim_loss+iou_loss
+      f_loss = MNModel._get_model_metric('sigmoid_focal_crossentropy')(y_true, y_pred)
+      hull_loss = mse_hull(y_true, y_pred)
+      edge_loss = mse_edge(y_true, y_pred)
+      return f_loss+hull_loss+edge_loss
 
-    metrics['hybrid_loss'] = hybrid_loss
-    metrics['ssim_loss'] = ssim_loss
+    metrics = { 
+      'hybrid_loss': hybrid_loss,
+      'dice_coef': MNModel._get_model_metric('dice_coef'),
+      'mean_iou': MNModel._get_model_metric('mean_iou'),
+      'mean_iou_with_nuc': MNModel._get_model_metric('mean_iou_with_nuc'),
+      'mse_hull': mse_hull,
+      'mse_edge': mse_edge,
+      'sigmoid_focal_crossentropy': MNModel._get_model_metric('sigmoid_focal_crossentropy')
+    }
 
     if name is None:
       return metrics
 
     return metrics[name]
-
-  def _get_custom_metrics(self):
-    return { 
-      'sigmoid_focal_crossentropy': self._get_model_metric('sigmoid_focal_crossentropy'), 
-      'ssim_loss': self._get_model_metric('ssim_loss'),
-      'mean_iou': self._get_model_metric('mean_iou'),
-      'mean_iou_with_nuc': self._get_model_metric('mean_iou_with_nuc')
-    }
 
   def _get_loss_function(self):
     return self._get_model_metric('hybrid_loss')
@@ -1703,7 +1806,7 @@ class TrainingDataGenerator:
   crop_image(img_idx=int)
     Generates crops of both images and masks
   """
-  def __init__(self, crop_size, data_path, augment=False, draw_border=False, skip_empty=True, num_per_image=None, post_hooks=None):
+  def __init__(self, crop_size, data_path, augment=False, draw_border=False, skip_empty=True, num_per_image=None, use_dist_masks=False, post_hooks=None):
     """
     Constructor
     
@@ -1745,6 +1848,8 @@ class TrainingDataGenerator:
     self.mn_masks_paths = []
     self.pn_masks_paths = []
 
+    self.distance_masks = {}
+
     mn_mask_dir_name = "mn_masks"
     pn_mask_dir_name = "nucleus_masks"
     image_dir_name = "images"
@@ -1760,6 +1865,11 @@ class TrainingDataGenerator:
         self.mn_masks_paths.append(mask_dir / x.name)
         self.pn_masks_paths.append(pn_dir / x.name)
         self.image_paths.append(image_dir / (x.stem + ".tif"))
+
+        self.distance_masks[str(mask_dir / x.name)] = self._get_distance_masks(
+          pn_dir / x.name,
+          mask_dir / x.name
+        )
 
   def __iter__(self):
     """
@@ -1792,6 +1902,59 @@ class TrainingDataGenerator:
       for data_point in data_points:
         yield data_point
 
+  def _get_full_mask(self, pn_mask, mn_mask):
+    full_mask = np.zeros((pn_mask.shape[0], pn_mask.shape[1], 3), dtype=np.uint16)
+    pn_colors = np.unique(np.reshape(pn_mask, (pn_mask.shape[0]*pn_mask.shape[1],4)), axis=0)
+    mn_colors = np.unique(np.reshape(mn_mask, (mn_mask.shape[0]*mn_mask.shape[1],4)), axis=0)
+    mn_id = 1
+    for color_id in pn_colors[...,2]:
+      if color_id == 0:
+        continue
+      full_mask[pn_mask[...,2] == color_id] = [ 1, color_id, 0 ]
+
+      for mn_color in mn_colors[mn_colors[...,2] == color_id][...,1]:
+        full_mask[(mn_mask[...,2] == color_id) & (mn_mask[...,1] == mn_color)] = [ 2, color_id, mn_id ]
+        mn_id += 1
+
+    return full_mask
+
+  def _get_distance_masks(self, pn_mask_path, mn_mask_path):
+    pn_mask = np.array(Image.open(pn_mask_path))
+    mn_mask = np.array(Image.open(mn_mask_path))
+
+    full_mask = self._get_full_mask(pn_mask, mn_mask)
+
+    hulls = np.zeros((full_mask.shape[0], full_mask.shape[1])).astype(np.uint16)
+    distances = np.zeros((full_mask.shape[0], full_mask.shape[1], 2)).astype(np.float64)
+
+    for cell_id in np.unique(full_mask[...,1]):
+      if cell_id == 0:
+        continue
+      y, x = np.where(full_mask[...,1] == cell_id)
+      coords = np.array(list(zip(x,y)))
+      ch = ConcaveHull()
+      ch.loadpoints(coords.tolist())
+      ch.calculatehull(tol=100)
+      vertices = np.expand_dims(ch.boundary_points(), axis=1).astype(np.int32)
+      hulls = cv2.fillPoly(hulls, [vertices], int(cell_id))
+
+    for hull_id in np.unique(hulls):
+      if hull_id == 0:
+        continue
+      tmp = np.zeros(( distances.shape[0], distances.shape[1] )).astype(np.float64)
+      tmp[hulls == hull_id] = 1
+      distances[...,0] += rescale_intensity(distance_transform_edt(tmp), out_range=(0,1))
+
+      tmp = np.ones(( distances.shape[0], distances.shape[1] )).astype(np.uint8)
+      tmp[(hulls != hull_id) & (hulls != 0)] = 0
+      tmp = distance_transform_edt(tmp)
+      tmp[hulls != hull_id] = 0
+      distances[...,1] += (1-rescale_intensity(tmp, out_range=(0,1)))**4
+    
+    distances[...,1] -= np.min(distances[...,1])
+    distances[...,1][hulls == 0] = 0
+    return distances
+
   def crop_image(self, img_idx):
     """
     Generate crops from a given image
@@ -1811,13 +1974,16 @@ class TrainingDataGenerator:
     pn_mask_path = self.pn_masks_paths[img_idx]
 
     channels = TrainingDataGenerator.open_image(image_path)
-    mask = TrainingDataGenerator.get_combined_mask(mn_mask_path, pn_mask_path)
-
-    if self.draw_border:
-      mn_mask = mask.copy()
-      mn_mask[mn_mask[...,0] != 2] = 0
-      outside = dilation(mn_mask, disk(2))
-      mask[(outside != 0) & (mask != 2)] = 3 # Generate boundaries
+    if self.use_dist_masks:
+      mask = self.get_dual_mask(mn_mask_path, pn_mask_path)
+    else:
+      mask = self.get_combined_mask(mn_mask_path, pn_mask_path)
+      if self.draw_border:
+        mn_mask = mask[...,2].copy()
+        mn_mask[mn_mask[...,0] != 2] = 0
+        outside = dilation(mn_mask, disk(2))
+        mask = np.expand_dims(mask, axis=-1)
+        mask[(outside != 0) & (mask != 2),3] = 1 # Generate boundaries
 
     datapoints = self._crop_image_random(channels, mask)
 
@@ -1888,7 +2054,9 @@ class TrainingDataGenerator:
       if self.augment:
         datapoint = self._augment_datapoint(datapoint)
 
-      if self.skip_empty and np.sum(datapoint['segmentation_mask']) <= 0:
+      if self.use_dist_masks and self.skip_empty and np.all(datapoint['segmentation_mask'] == 0):
+        continue
+      elif self.skip_empty and np.sum(datapoint['segmentation_mask']) <= 0:
         continue
 
       datapoints.append(datapoint)
@@ -1915,8 +2083,8 @@ class TrainingDataGenerator:
       A.Rotate(p=0.5, limit=(-90,270), border_mode=cv2.BORDER_REFLECT),
       A.Transpose(p=0.5),
       # A.MaskDropout(p=0.5, max_objects=(0,5), image_fill_value=np.median(datapoint['image'][...,0]))
-      A.Perspective(p=0.3, scale=[0.05, 0.08]),
-      A.ElasticTransform(p=1.0, alpha=12, sigma=15, alpha_affine=5, border_mode=cv2.BORDER_REFLECT, value=0)
+      # A.Perspective(p=0.3, scale=[0.05, 0.08]),
+      # A.ElasticTransform(p=1.0, alpha=12, sigma=15, alpha_affine=5, border_mode=cv2.BORDER_REFLECT, value=0)
     ])
 
     augmented = aug(image=datapoint['image'], mask=datapoint['segmentation_mask'])
@@ -1984,8 +2152,28 @@ class TrainingDataGenerator:
     channels += edges
     return channels
 
-  @staticmethod
-  def get_combined_mask(mn_mask_path, pn_mask_path):
+  def get_dual_mask(self, mn_mask_path, pn_mask_path):
+    """
+    Read nucleis and MN masks and combine into a single image
+
+    Nuclei = 1, MN = 2
+    
+    Parameters
+    --------
+    mn_mask_path : Path|str
+      Path to the MN mask
+    pn_mask_path : Path|str
+      Path to the nucleus mask
+    
+    Returns
+    --------
+    np.array
+    """
+    mask = self.get_combined_mask(mn_mask_path, pn_mask_path)
+
+    return np.stack([ mask[...,0], mask[...,1], mask[...,2], self.distance_masks[str(mn_mask_path)][...,0], self.distance_masks[str(mn_mask_path)][...,1]], axis=-1)
+
+  def get_combined_mask(self, mn_mask_path, pn_mask_path):
     """
     Read nucleis and MN masks and combine into a single image
 
@@ -2005,17 +2193,25 @@ class TrainingDataGenerator:
     pn_details = TrainingDataGenerator.open_mask(pn_mask_path)
     mn_details = TrainingDataGenerator.open_mask(mn_mask_path)
 
+    nuc_mask = np.zeros(( pn_details.shape[0], pn_details.shape[1] ), dtype=np.float64)
+    mn_mask = np.zeros_like(nuc_mask)
+    bg_mask = np.zeros_like(nuc_mask)
+
+    nuc_mask[(pn_details[...,0] > 0)] = 1 # Nucleus
+    mn_mask[(mn_details[...,0] > 0)] = 1 # MN
+    bg_mask[(pn_details[...,0] == 0) & (mn_details[...,0] == 0)] = 1
+
     mask = np.zeros(( pn_details.shape[0], pn_details.shape[1] ), dtype=np.uint8)
     mask[(pn_details[...,0] > 0)] = 1 # Nucleus
     mask[(mn_details[...,0] > 0)] = 2 # MN
 
-    return mask
+    return np.stack([ bg_mask, nuc_mask, mn_mask ], axis=-1)
 
 class TFData(Sequence):
   """
   Provides training and validation data during training
   """
-  def __init__(self, crop_size, data_path, batch_size, num_per_image, **kwargs):
+  def __init__(self, crop_size, data_path, batch_size, num_per_image, use_dist_masks=False, **kwargs):
     """
     Load a TrainingDataGenerator class
 
@@ -2034,6 +2230,7 @@ class TFData(Sequence):
       crop_size,
       data_path,
       num_per_image=num_per_image,
+      use_dist_masks=use_dist_masks,
       **kwargs
     )
     self.num_images = len(self.dg.mn_masks_paths)
