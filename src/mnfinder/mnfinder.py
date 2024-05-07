@@ -4,19 +4,16 @@ from pathlib import Path
 import tensorflow as tf
 import tensorflow.keras.backend as K
 from tensorflow.keras.utils import Sequence
-import json
 from skimage.filters import sobel, threshold_li, threshold_yen
 from skimage.feature import peak_local_max
 from skimage.measure import regionprops_table, label
 from skimage.morphology import disk, binary_opening, convex_hull_image, skeletonize, binary_dilation
 from skimage.exposure import rescale_intensity, adjust_gamma, adjust_sigmoid
-from skimage.color import label2rgb
-from skimage.segmentation import clear_border, watershed, find_boundaries
-from scipy import spatial
+from skimage.segmentation import clear_border, watershed, find_boundaries, expand_labels
 import pandas as pd
 import numpy as np
 import cv2
-from tifffile import TiffWriter, TiffFile, tifffile
+from tifffile import tifffile
 import requests
 import tarfile
 from tqdm import tqdm
@@ -29,6 +26,10 @@ from datetime import datetime
 from platformdirs import PlatformDirs
 import inspect
 import importlib
+
+from cdBoundary.boundary import ConcaveHull
+from scipy.ndimage import distance_transform_edt
+from scipy import spatial
 
 __version__ = "1.1.0"
 dirs = PlatformDirs("MNFinder", "Hatch-Lab", __version__)
@@ -216,7 +217,7 @@ class MNModel:
     raise IncorrectDimensions()
 
   @staticmethod
-  def eval_mn_prediction(mn_true_masks, mn_labels):
+  def eval_mn_prediction(full_mask, labels):
     """
     Evaluates the results of a prediction against ground truth
 
@@ -226,18 +227,18 @@ class MNModel:
 
     Parameters
     --------
-    mn_true_masks : np.array
-      Ground truth. MN masks should be annotated such that pixels
-      belonging to a given MN have connectivity=1 (Rook-style 
-      contiguity) and separate MN have at least 1 px of space or
-      only touch at the diagonal
+    full_mask : np.array
+      Ground truth. Should be an NxNx3 matrix. All pixels that are
+      nuclei should be [ 1, ID, 0 ]. All pixels that are MN should
+      be [ 2, ID, MN_ID ], where ID is a unique ID for each cell
+      and MN_ID is a unique ID for each MN. 
 
-      If so desired, ruptured MN can be assigned a pixel value of 2
-      and intact a pixel value of 1, and this will be included in the
+      If so desired, ruptured MN can be assigned with pixel values of
+      [ 3, ID, MN_ID ], and this will be included in the
       analysis. Often, ruptured MN are more difficult to identify,
       likely because smaller MN are more likely to rupture
-    mn_labels : np.array
-      The predicted labels
+    labels : np.array
+      The predicted labels from MNClassifier.predict()
       
     Returns
     --------
@@ -248,117 +249,214 @@ class MNModel:
     pd.DataFrame
       Summary statistics
     """
-    true_mn_labels = label(mn_true_masks, connectivity=1)
-
-    intact_mn = np.zeros_like(true_mn_labels)
-    ruptured_mn = np.zeros_like(true_mn_labels)
-    intact_mn[(mn_true_masks == 1)] = 1
-    ruptured_mn[(mn_true_masks == 2)] = 1
+    intact_mn = np.zeros(( full_mask.shape[0], full_mask.shape[1] ), dtype=np.uint16)
+    ruptured_mn = np.zeros(( full_mask.shape[0], full_mask.shape[1] ), dtype=np.uint16)
+    intact_mn[(full_mask[...,0] == 2)] = 1
+    ruptured_mn[(full_mask[...,0] == 3)] = 1
 
     mn_df = {
-      'true_mn_label': [], # The real MN label
+      'mn_id': [], # The real MN label
+      'cell_id': [], # Cell ID
       'intact': [], # If this MN is intact or ruptured
       'found': [], # If any portion of this segment overlapped with 1 or more predictions
       'area': [], # The area in square pixels
       'proportion_segmented': [], # The amount of overlap between prediction and truth
       'pred_labels': [], # The label IDs of any predictions that overlap
+      'pred_cell_labels': []
     }
 
-    pred_df = {
-      'pred_mn_label': [], # The prediction label
+    pred_mn_df = {
+      'mn_label': [], # The prediction label
+      'cell_label': [], 
       'exists': [], # If any portion of this prediction overlapped with 1 or more real MN
       'area': [], # The area in square pixels
       'proportion_true': [], # The proportion of overlap between prediction and truths
-      'true_labels': [], # The label IDs of any true MN that overlap
+      'true_ids': [], # The label IDs of any true MN that overlap
+      'correctly_assigned': [] # If this MN is assigned to the correct nucleus
+    }
+
+    nuc_df = {
+      'cell_id': [],
+      'found': [],
+      'area': [],
+      'proportion_segmented': [],
+      'pred_labels': []
+    }
+
+    pred_nuc_df = {
+      'cell_label': [],
+      'exists': [],
+      'area': [],
+      'proportion_true': [],
+      'true_ids': []
     }
 
     summary_df = {
       'num_mn': [], # The number of MN in this image
+      'num_nuclei': [],
       'num_intact_mn': [], # The number of intact MN
       'num_ruptured_mn': [], # The number of ruptured MN
-      'num_predictions': [], # The number of predictions
+      'num_mn_predictions': [], # The number of predictions
+      'num_nuclei_predictions': [], # The number of predictions
       'num_mn_found': [], # The number of MN that overlap to any degree with predictions
+      'num_nuclei_found': [], 
       'num_intact_mn_found': [], # The number of intact MN that overlap to any degree with predictions
       'num_ruptured_mn_found': [], # The number of ruptured MN that overlap to any degree with predictions
-      'iou': [], # The overall intersection over union of this image
-      'intersection': [], # The intersection of predictions and truth
-      'divergence': [] # The proportion of predictions that do not overlap with truth
+      'mn_iou': [], # The overall intersection over union of this image
+      'nuclei_iou': [],
+      'combined_iou': [],
+      'mn_intersection': [], # The intersection of predictions and truth
+      'nuclei_intersection': [], 
+      'combined_intersection': [],
+      'mn_divergence': [], # The proportion of predictions that do not overlap with truth
+      'nuclei_divergence': [],
+      'combined_divergence': []
     }
     # Summary also contains PPV and and recall statistics
 
-    for true_mn_label in np.unique(true_mn_labels):
-      if true_mn_label == 0:
-        continue
+    # True stats
+    full_mask[...,0] = clear_border(full_mask[...,0])
+    full_mask[...,1] = clear_border(full_mask[...,1])
+    full_mask[...,2] = clear_border(full_mask[...,2])
+    for cell_id in np.unique(full_mask[(full_mask[...,1] != 0),1]):
+      for mn_id in np.unique(full_mask[(full_mask[...,1] == cell_id) & (full_mask[...,2] != 0),2]):
+        mn_df['mn_id'].append(mn_id)
+        mn_df['cell_id'].append(cell_id)
+        idx = (full_mask[...,2] == mn_id)
+        if np.sum(intact_mn[idx]) > 0:
+          mn_df['intact'].append(True)
+        else:
+          mn_df['intact'].append(False)
 
-      mn_df['true_mn_label'].append(true_mn_label)
-      if np.sum(intact_mn[(true_mn_labels == true_mn_label)]) > 0:
-        mn_df['intact'].append(True)
-      else:
-        mn_df['intact'].append(False)
+        mn_df['area'].append(np.sum(idx))
 
-      area = np.sum((true_mn_labels == true_mn_label))
-      mn_df['area'].append(area)
+        pred_overlap = np.sum(np.logical_and(idx, labels[...,2] > 0))
+        if pred_overlap > 0:
+          mn_df['found'].append(True)
+          mn_df['proportion_segmented'].append(
+            pred_overlap/np.sum(idx)
+          )
+          mn_df['pred_labels'].append(np.unique(labels[(idx) & (labels[...,2] != 0),2]))
+          mn_df['pred_cell_labels'].append(np.unique(labels[(idx) & (labels[...,1] != 0),1]))
+        else:
+          mn_df['found'].append(False)
+          mn_df['proportion_segmented'].append(0.)
+          mn_df['pred_labels'].append([])
+          mn_df['pred_cell_labels'].append([])
 
-      pred_overlap = np.sum(np.logical_and((true_mn_labels == true_mn_label), ( mn_labels > 0 )))
+      nuc_df['cell_id'].append(cell_id)
+      idx = (full_mask[...,1] == cell_id)
+
+      nuc_df['area'].append(np.sum(idx))
+      pred_overlap = np.sum(np.logical_and(idx, labels[...,0] > 0))
       if pred_overlap > 0:
-        mn_df['found'].append(True)
-        mn_df['proportion_segmented'].append(
-          pred_overlap/area
+        nuc_df['found'].append(True)
+        nuc_df['proportion_segmented'].append(
+          pred_overlap/np.sum(idx)
         )
-        mn_df['pred_labels'].append(np.unique(mn_labels[(true_mn_labels == true_mn_label) & (mn_labels > 0)]))
+        nuc_df['pred_labels'].append(np.unique(labels[(idx) & (labels[...,0] != 0),0]))
       else:
-        mn_df['found'].append(False)
-        mn_df['proportion_segmented'].append(0.)
-        mn_df['pred_labels'].append([])
+        nuc_df['found'].append(False)
+        nuc_df['proportion_segmented'].append(0.)
+        nuc_df['pred_labels'].append([])
 
-    for mn_label in np.unique(mn_labels):
-      if mn_label == 0:
-        continue
+    # Pred stats
+    for cell_label in np.unique(labels[labels[...,0] != 0, 0]):
+      for mn_label in np.unique(labels[labels[...,1] == cell_label,2]):
+        pred_mn_df['mn_label'].append(mn_label)
+        pred_mn_df['cell_label'].append(cell_label)
+        
+        idx = (labels[...,2] == mn_label)
 
-      pred_df['pred_mn_label'].append(mn_label)
-      area = np.sum((mn_labels == mn_label))
-      pred_df['area'].append(area)
+        pred_mn_df['area'].append(np.sum(idx))
 
-      true_overlap = np.sum(np.logical_and((mn_labels == mn_label), ( true_mn_labels > 0 )))
-      if true_overlap > 0:
-        pred_df['exists'].append(True)
-        pred_df['proportion_true'].append(
-          true_overlap/area
+        pred_overlap = np.sum(np.logical_and(idx, full_mask[...,2] > 0))
+        if pred_overlap > 0:
+          pred_mn_df['exists'].append(True)
+          pred_mn_df['proportion_true'].append(
+            pred_overlap/np.sum(idx)
+          )
+          pred_mn_df['true_ids'].append(np.unique(full_mask[(idx) & (full_mask[...,2] != 0),2]))
+          cell_ids = np.unique(full_mask[(idx) & (full_mask[...,1] != 0),1])
+          if np.intersect1d(full_mask[(labels[...,0] == cell_label),0], cell_ids).shape[0] > 0:
+            pred_mn_df['correctly_assigned'].append(True)
+          else:
+            pred_mn_df['correctly_assigned'].append(False)
+        else:
+          pred_mn_df['exists'].append(False)
+          pred_mn_df['proportion_true'].append(0.)
+          pred_mn_df['true_ids'].append([])
+          pred_mn_df['correctly_assigned'].append(False)
+
+      pred_nuc_df['cell_label'].append(cell_label)
+      idx = (labels[...,0] == cell_label)
+
+      pred_nuc_df['area'].append(np.sum(idx))
+      pred_overlap = np.sum(np.logical_and(idx, full_mask[...,0] > 0))
+      if pred_overlap > 0:
+        pred_nuc_df['exists'].append(True)
+        pred_nuc_df['proportion_true'].append(
+          pred_overlap/np.sum(idx)
         )
-        pred_df['true_labels'].append(np.unique(true_mn_labels[(mn_labels == mn_label) & (true_mn_labels > 0)]))
+        pred_nuc_df['true_ids'].append(np.unique(full_mask[(idx) & (full_mask[...,1] != 0),1]))
       else:
-        pred_df['exists'].append(False)
-        pred_df['proportion_true'].append(0.)
-        pred_df['true_labels'].append([])
+        pred_nuc_df['exists'].append(False)
+        pred_nuc_df['proportion_true'].append(0.)
+        pred_nuc_df['true_ids'].append([])
 
     mn_df = pd.DataFrame(mn_df)
-    pred_df = pd.DataFrame(pred_df)
+    pred_mn_df = pd.DataFrame(pred_mn_df)
+    nuc_df = pd.DataFrame(nuc_df)
+    pred_nuc_df = pd.DataFrame(pred_nuc_df)
 
     summary_df['num_mn'].append(mn_df.shape[0])
+    summary_df['num_nuclei'].append(nuc_df.shape[0])
     summary_df['num_intact_mn'].append(np.sum(mn_df['intact']))
     summary_df['num_ruptured_mn'].append(mn_df.shape[0]-np.sum(mn_df['intact']))
-    summary_df['num_predictions'].append(pred_df.shape[0])
+    summary_df['num_mn_predictions'].append(pred_mn_df.shape[0])
+    summary_df['num_nuclei_predictions'].append(pred_nuc_df.shape[0])
     summary_df['num_mn_found'].append(np.sum(mn_df['found']))
+    summary_df['num_nuclei_found'].append(np.sum(nuc_df['found']))
     summary_df['num_intact_mn_found'].append(np.sum(mn_df.loc[mn_df['intact'] == True, 'found']))
     summary_df['num_ruptured_mn_found'].append(np.sum(mn_df.loc[mn_df['intact'] == False, 'found']))
 
-    intersection = np.sum(np.logical_and((mn_labels > 0), (true_mn_labels > 0)))
-    union = np.sum(np.logical_or((mn_labels > 0), (true_mn_labels > 0)))
-    if union == 0:
-      summary_df['iou'].append(0)
+    mn_intersection = np.sum(np.logical_and((full_mask[...,2] > 0), (labels[...,2] > 0)))
+    mn_union = np.sum(np.logical_or((full_mask[...,2] > 0), (labels[...,2] > 0)))
+    if mn_union == 0:
+      summary_df['mn_iou'].append(0)
     else:
-      summary_df['iou'].append(intersection / union)
-    summary_df['intersection'].append(intersection)
-    summary_df['divergence'].append(np.sum(mn_labels > 0)-intersection)
+      summary_df['mn_iou'].append(mn_intersection / mn_union)
+    summary_df['mn_intersection'].append(mn_intersection)
+    summary_df['mn_divergence'].append(np.sum(labels[...,2] > 0)-mn_intersection)
+
+    nuc_intersection = np.sum(np.logical_and((full_mask[...,0] > 0), (labels[...,0] > 0)))
+    nuc_union = np.sum(np.logical_or((full_mask[...,0] > 0), (labels[...,0] > 0)))
+    if nuc_union == 0:
+      summary_df['nuclei_iou'].append(0)
+    else:
+      summary_df['nuclei_iou'].append(nuc_intersection / nuc_union)
+    summary_df['nuclei_intersection'].append(nuc_intersection)
+    summary_df['nuclei_divergence'].append(np.sum(labels[...,0] > 0)-nuc_intersection)
+
+    combined_intersection = mn_intersection + nuc_intersection
+    combined_union = mn_union + nuc_union
+    if combined_union == 0:
+      summary_df['combined_iou'].append(0)
+    else:
+      summary_df['combined_iou'].append(combined_intersection / combined_union)
+    summary_df['combined_intersection'].append(combined_intersection)
+    summary_df['combined_divergence'].append(np.sum((labels[...,2] > 0) | (labels[...,0] > 0))-combined_intersection)
 
     summary_df = pd.DataFrame(summary_df)
 
-    summary_df['ppv'] = summary_df['num_mn_found']/summary_df['num_predictions']
-    summary_df['recall'] = summary_df['num_mn_found']/summary_df['num_mn']
+    summary_df['mn_ppv'] = summary_df['num_mn_found']/summary_df['num_mn_predictions']
+    summary_df['nuclei_ppv'] = summary_df['num_nuclei_found']/summary_df['num_nuclei_predictions']
+    summary_df['mn_recall'] = summary_df['num_mn_found']/summary_df['num_mn']
+    summary_df['nuclei_recall'] = summary_df['num_nuclei_found']/summary_df['num_nuclei']
     summary_df['intact_recall'] = summary_df['num_intact_mn_found']/summary_df['num_intact_mn']
     summary_df['ruptured_recall'] = summary_df['num_ruptured_mn_found']/summary_df['num_ruptured_mn']
 
-    return mn_df, pred_df, summary_df
+    return mn_df, nuc_df, pred_mn_df, pred_nuc_df, summary_df
 
   crop_size = 128
   oversample_ratio = 0.25
@@ -1205,10 +1303,6 @@ class MNClassifier(MNModel):
     --------
     np.array
       The nucleus labels
-    np.array
-      The MN labels
-    np.array
-      Labels assigning MN to nuclei
     """
     if skip_opening is None:
       skip_opening = self.defaults.skip_opening
@@ -1608,6 +1702,9 @@ class MNSegmenter(MNModel):
     mn_nuc_labels[...,1] = clear_border(mn_nuc_labels[...,1])
     mn_nuc_labels[...,2] = clear_border(mn_labels)
 
+    mn_nuc_labels[...,0] = expand_labels(mn_nuc_labels[...,0], 1)
+    mn_nuc_labels[...,0][mn_nuc_labels[...,1] > 0] = 0
+
     return mn_nuc_labels, field_output
 
 
@@ -1730,11 +1827,11 @@ class TrainingDataGenerator:
         self.mn_masks_paths.append(mask_dir / x.name)
         self.pn_masks_paths.append(pn_dir / x.name)
         self.image_paths.append(image_dir / (x.stem + ".tif"))
-
-        self.distance_masks[str(mask_dir / x.name)] = self._get_distance_masks(
-          pn_dir / x.name,
-          mask_dir / x.name
-        )
+        if use_dist_masks:
+          self.distance_masks[str(mask_dir / x.name)] = self._get_distance_masks(
+            pn_dir / x.name,
+            mask_dir / x.name
+          )
 
   def __iter__(self):
     """
@@ -1780,6 +1877,8 @@ class TrainingDataGenerator:
       for mn_color in mn_colors[mn_colors[...,2] == color_id][...,1]:
         full_mask[(mn_mask[...,2] == color_id) & (mn_mask[...,1] == mn_color)] = [ 2, color_id, mn_id ]
         mn_id += 1
+
+    full_mask[...,2] = label(full_mask[...,2])
 
     return full_mask
 
@@ -2065,10 +2164,6 @@ class TrainingDataGenerator:
     nuc_mask[(pn_details[...,0] > 0)] = 1 # Nucleus
     mn_mask[(mn_details[...,0] > 0)] = 1 # MN
     bg_mask[(pn_details[...,0] == 0) & (mn_details[...,0] == 0)] = 1
-
-    mask = np.zeros(( pn_details.shape[0], pn_details.shape[1] ), dtype=np.uint8)
-    mask[(pn_details[...,0] > 0)] = 1 # Nucleus
-    mask[(mn_details[...,0] > 0)] = 2 # MN
 
     return np.stack([ bg_mask, nuc_mask, mn_mask ], axis=-1)
 

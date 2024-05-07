@@ -1,5 +1,7 @@
 from .mnfinder import MNSegmenter, MNModelDefaults
 from .kerasmodels import SegmenterUNet
+import tensorflow as tf
+import numpy as np
 
 class DistSegmenter(MNSegmenter):
   model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/DistSegmenter.tar.gz'

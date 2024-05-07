@@ -1,5 +1,13 @@
 from .mnfinder import MNClassifier, MNModelDefaults
 from .kerasmodels import AttentionUNet, MSAttentionUNet
+import tensorflow as tf
+import numpy as np
+import pandas as pd
+import cv2
+from skimage.filters import sobel
+from skimage.measure import regionprops_table, label
+from skimage.morphology import disk, opening
+from skimage.exposure import rescale_intensity, adjust_gamma
 
 class LaplaceDeconstruction(MNClassifier):
   """
@@ -279,83 +287,83 @@ class MSAttention96(MSAttention):
     self.defaults.use_argmax = True
     self.defaults.opening_radius = 1
 
-class SimpleCombined(MNClassifier):
-  """
-  A simple ensembling method where MN masks from multiple models
-  are combined together as a simple union, but with some size filtering
-  """
-  model_url = None
+# class SimpleCombined(MNClassifier):
+#   """
+#   A simple ensembling method where MN masks from multiple models
+#   are combined together as a simple union, but with some size filtering
+#   """
+#   model_url = None
 
-  crop_size = 128
+#   crop_size = 128
 
-  def __init__(self, weights_path=None, trained_model=None):
-    super().__init__() # There are no weights or trained model to load
+#   def __init__(self, weights_path=None, trained_model=None):
+#     super().__init__() # There are no weights or trained model to load
 
-    # The base model will be used to generate
-    self.base_model = MNClassifier.get_model("Attention")
-    self.supplementary_models = [
-      MNClassifier.get_model("MSAttention")
-    ]
+#     # The base model will be used to generate
+#     self.base_model = MNClassifier.get_model("Attention")
+#     self.supplementary_models = [
+#       MNClassifier.get_model("MSAttention")
+#     ]
     
-  def _load_model(self, weights_path=None):
-    return True
+#   def _load_model(self, weights_path=None):
+#     return True
 
-  def predict(self, img, skip_opening=None, expand_masks=None, use_argmax=None, area_thresh=250, **kwargs):
-    """
-    Generates MN and nuclear segments
+#   def predict(self, img, skip_opening=None, expand_masks=None, use_argmax=None, area_thresh=250, **kwargs):
+#     """
+#     Generates MN and nuclear segments
 
-    Parameters
-    --------
-    img : np.array
-      The image to predict
-    skip_opening : bool|None
-      Whether to skip running binary opening on MN predictions. If None, defaults
-      to this model's value in self.defaults.skip_opening
-    expand_masks : bool|None
-      Whether to expand MN segments to their convex hull. If None, defaults
-      to self.defaults.expand_masks
-    use_argmax : bool|None
-      If true, pixel classes are assigned to whichever class has the highest
-      probability. If false, MN are assigned by self.bg_max and self.fg_min 
-      thresholds 
-    area_thresh : int|False
-      Larger MN that are separate from the nucleus tend to be called as nuclei.
-      Any nucleus segments < area_thresh will be converted to MN. If False, this
-      will not be done
+#     Parameters
+#     --------
+#     img : np.array
+#       The image to predict
+#     skip_opening : bool|None
+#       Whether to skip running binary opening on MN predictions. If None, defaults
+#       to this model's value in self.defaults.skip_opening
+#     expand_masks : bool|None
+#       Whether to expand MN segments to their convex hull. If None, defaults
+#       to self.defaults.expand_masks
+#     use_argmax : bool|None
+#       If true, pixel classes are assigned to whichever class has the highest
+#       probability. If false, MN are assigned by self.bg_max and self.fg_min 
+#       thresholds 
+#     area_thresh : int|False
+#       Larger MN that are separate from the nucleus tend to be called as nuclei.
+#       Any nucleus segments < area_thresh will be converted to MN. If False, this
+#       will not be done
     
-    Returns
-    --------
-    np.array
-      The nucleus labels
-    np.array
-      The MN labels
-    np.array
-      The raw output form the neural net
-    """
-    if skip_opening is None:
-      skip_opening = self.defaults.skip_opening
+#     Returns
+#     --------
+#     np.array
+#       The nucleus labels
+#     np.array
+#       The MN labels
+#     np.array
+#       The raw output form the neural net
+#     """
+#     if skip_opening is None:
+#       skip_opening = self.defaults.skip_opening
 
-    if expand_masks is None:
-      expand_masks = self.defaults.expand_masks
+#     if expand_masks is None:
+#       expand_masks = self.defaults.expand_masks
 
-    if use_argmax is None:
-      use_argmax = self.defaults.use_argmax
+#     if use_argmax is None:
+#       use_argmax = self.defaults.use_argmax
 
-    nucleus_labels, base_mn_labels, base_mn_nuc_labels, field_output = self.base_model.predict(img, skip_opening, expand_masks, use_argmax, area_thresh)
+#     labels = self.base_model.predict(img, skip_opening, expand_masks, use_argmax, area_thresh)
 
-    base_mn_labels = (base_mn_labels != 0).astype(np.uint16)
-    for idx,model in enumerate(self.supplementary_models):
-      _, mn_labels, mn_nuc_labels, raw = model.predict(img, skip_opening, expand_masks, use_argmax, area_thresh)
-      mn_labels = opening(mn_labels, footprint=disk(2))
-      mn_nuc_labels = opening(mn_nuc_labels, footprint=disk(2))
-      mn_info = pd.DataFrame(regionprops_table(mn_labels, properties=('label', 'solidity', 'area')))
-      keep_labels = mn_info['label'].loc[(mn_info['area'] < 250)]
-      base_mn_labels[~np.isin(mn_labels, keep_labels)] = 0
-      base_mn_nuc_labels[~np.isin(mn_labels, keep_labels)] = 0
+#     base_mn_labels = (base_mn_labels != 0).astype(np.uint16)
+#     for idx,model in enumerate(self.supplementary_models):
+#       _, mn_labels, mn_nuc_labels, raw = model.predict(img, skip_opening, expand_masks, use_argmax, area_thresh)
+#       mn_labels = opening(mn_labels, footprint=disk(2))
+#       mn_nuc_labels = opening(mn_nuc_labels, footprint=disk(2))
+#       mn_info = pd.DataFrame(regionprops_table(mn_labels, properties=('label', 'solidity', 'area')))
+#       keep_labels = mn_info['label'].loc[(mn_info['area'] < 250)]
+#       base_mn_labels[~np.isin(mn_labels, keep_labels)] = 0
+#       base_mn_nuc_labels[~np.isin(mn_labels, keep_labels)] = 0
 
-    nucleus_labels[base_mn_labels != 0] = 0
+#     nucleus_labels[base_mn_labels != 0] = 0
     
-    return nucleus_labels, base_mn_labels, field_output
+#     return nucleus_labels, base_mn_labels, field_output
   
 class Combined(MNClassifier):
   """
