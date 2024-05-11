@@ -42,6 +42,3 @@ class DistSegmenter(MNSegmenter):
 
   def _get_loss_function(self):
     return self._get_model_metric('hybrid_loss')
-
-  def _get_loss_weights(self):
-    return None

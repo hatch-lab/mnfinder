@@ -26,6 +26,7 @@ from datetime import datetime
 from platformdirs import PlatformDirs
 import inspect
 import importlib
+from importlib.metadata import version
 
 from cdBoundary.boundary import ConcaveHull
 from scipy.ndimage import distance_transform_edt
@@ -117,6 +118,12 @@ class MNModel:
   training_root = (Path(__file__) / "../training-data").resolve()
   validation_root = (Path(__file__) / "../validation-data").resolve()
   testing_root = (Path(__file__) / "../test-data").resolve()
+
+  class_type = "none"
+
+  def get_tf_version(self):
+    tf_version = version('tensorflow').split('.')
+    return int(tf_version[0]), int(tf_version[1])
 
   @staticmethod
   def get_available_models():
@@ -245,7 +252,11 @@ class MNModel:
     pd.DataFrame
       Information about each true MN segment
     pd.DataFrame
-      Information about each prediction
+      Information about each true nucleus segment
+    pd.DataFrame
+      Information about each MN prediction
+    pd.DataFrame
+      Information about each nucleus prediction
     pd.DataFrame
       Summary statistics
     """
@@ -530,7 +541,10 @@ class MNModel:
       model_gzip_path.unlink()
 
     self.trained_model = self._build_model()
-    self.trained_model.load_weights(self._get_path() / "final.weights.h5", skip_mismatch=True, by_name=True)
+    if self.get_tf_version()[1] < 16:
+      self.trained_model.load_weights(self._get_path() / "final.weights.h5", skip_mismatch=True, by_name=True)
+    else:
+      self.trained_model.load_weights(self._get_path() / "final.weights.h5", skip_mismatch=True)
 
   def _get_field_predictions(self, img):
     coords, dataset, predictions = self._get_mn_predictions(img)
@@ -810,24 +824,24 @@ class MNModel:
       y_true_f = tf.cast(y_true[...,0:3], y_pred_f.dtype)
 
       # Get the cross_entropy for each entry
-      ce = K.binary_crossentropy(y_true, y_pred, from_logits=from_logits)
+      ce = K.binary_crossentropy(y_true_f, y_pred_f, from_logits=from_logits)
 
       # If logits are provided then convert the predictions into probabilities
       if from_logits:
-        pred_prob = tf.sigmoid(y_pred)
+        pred_prob = tf.sigmoid(y_pred_f)
       else:
-        pred_prob = y_pred
+        pred_prob = y_pred_f
 
-      p_t = (y_true * pred_prob) + ((1 - y_true) * (1 - pred_prob))
+      p_t = (y_true_f * pred_prob) + ((1 - y_true_f) * (1 - pred_prob))
       alpha_factor = 1.0
       modulating_factor = 1.0
 
       if alpha:
-        alpha = tf.cast(alpha, dtype=y_true.dtype)
-        alpha_factor = y_true * alpha + (1 - y_true) * (1 - alpha)
+        alpha = tf.cast(alpha, dtype=y_true_f.dtype)
+        alpha_factor = y_true_f * alpha + (1 - y_true_f) * (1 - alpha)
 
       if gamma:
-        gamma = tf.cast(gamma, dtype=y_true.dtype)
+        gamma = tf.cast(gamma, dtype=y_true_f.dtype)
         modulating_factor = tf.pow((1.0 - p_t), gamma)
 
       # compute the final loss and return
@@ -1122,7 +1136,7 @@ class MNModel:
     --------
     list|None
     """
-    return [ 1.0, 10.0, 800.0 ]
+    return None
 
 class MNClassifier(MNModel):
   """
@@ -1185,6 +1199,8 @@ class MNClassifier(MNModel):
     Build and train a model from scratch
   """
 
+  class_type = "classifier"
+
   @staticmethod
   def get_available_models():
     """
@@ -1200,7 +1216,7 @@ class MNClassifier(MNModel):
       classifiers = sys.modules['mnfinder.classifiers']
     else:
       classifiers = importlib.import_module('mnfinder.classifiers')
-    available_models = [ x[0] for x in inspect.getmembers(classifiers, inspect.isclass) if issubclass(x[1], MNClassifier) ]
+    available_models = [ x[0] for x in inspect.getmembers(classifiers, inspect.isclass) if hasattr(x[1], 'class_type') and x[1].class_type == "classifier" ]
     return available_models
 
   @staticmethod
@@ -1318,6 +1334,7 @@ class MNClassifier(MNModel):
       raise ValueError("Image is smaller than minimum size of {}x{}".format(self.crop_size, self.crop_size))
 
     nucleus_pixels, mn_pixels, classifier_output = self._run_pixel_classifier(img, skip_opening=skip_opening, expand_masks=expand_masks, use_argmax=use_argmax, area_thresh=area_thresh)
+
     labels, segmenter_output = self._run_segmenter(img, nucleus_pixels, mn_pixels)
 
     if return_raw_output:
@@ -1403,11 +1420,10 @@ class MNClassifier(MNModel):
     Returns
     --------
     np.array
-      The pixels classified as nuclei
+      An array with 3 channels: nucleus labels, MN labelled with their
+      assigned nucleus label, unique MN labels
     np.array
-      The pixels classified as MN
-    np.array
-      The raw output of the field
+      The raw output of the segmenter
     """
     if self.segmenter is None:
       nucleus_labels = label(nucleus_pixels, connectivity=1)
@@ -1609,11 +1625,10 @@ class MNSegmenter(MNModel):
     Returns
     --------
     np.array
-      The nucleus labels
+      An array with 3 channels: nucleus labels, MN labelled with their
+      assigned nucleus label, unique MN labels
     np.array
-      The MN labels
-    np.array
-      Labels assigning MN to nuclei
+      Raw output
     """
     field_output = self._get_field_predictions(img)
 
@@ -1678,12 +1693,12 @@ class MNSegmenter(MNModel):
     mn_nuc_labels[mn_pixels == 0, 1] = 0
 
     # Merge in any MN pixels not covered by labels
+    nuc_info = regionprops_table(nucleus_labels, properties=('label', 'centroid'))
+    nuc_tree = spatial.KDTree(list(zip(nuc_info['centroid-1'], nuc_info['centroid-0'])))
+
     orphan_mn_labels = np.unique(mn_labels[(mn_nuc_labels[...,1] == 0) & (mn_labels != 0)])
     if len(orphan_mn_labels) > 0:
-      nuc_info = regionprops_table(nucleus_labels, properties=('label', 'centroid'))
       mn_info = pd.DataFrame(regionprops_table(mn_labels, properties=('label', 'centroid')))
-
-      nuc_tree = spatial.KDTree(list(zip(nuc_info['centroid-1'], nuc_info['centroid-0'])))
       for orphan_label in orphan_mn_labels:
         new_labels, counts = np.unique(mn_nuc_labels[(mn_labels == orphan_label) & (mn_nuc_labels[...,1] != 0),1], return_counts=True)
 
@@ -1697,6 +1712,16 @@ class MNSegmenter(MNModel):
           y = mn_info.loc[mn_info.label == orphan_label, 'centroid-0'].iloc[0]
           res = nuc_tree.query([ x, y ], k=1)
           mn_nuc_labels[mn_labels == orphan_label,1] = nuc_info['label'][res[1]]
+
+    # Reassign any MN that were segmented, but have no nucleus
+    orphan_mn_nuc_labels = np.setdiff1d(np.unique(mn_nuc_labels[...,1]), np.unique(mn_nuc_labels[...,0]))
+    if len(orphan_mn_nuc_labels) > 0:
+      mn_info = pd.DataFrame(regionprops_table(mn_nuc_labels[...,1], properties=('label', 'centroid')))
+      for orphan_label in orphan_mn_nuc_labels:
+        x = mn_info.loc[mn_info.label == orphan_label, 'centroid-1'].iloc[0]
+        y = mn_info.loc[mn_info.label == orphan_label, 'centroid-0'].iloc[0]
+        res = nuc_tree.query([ x, y ], k=1)
+        mn_nuc_labels[mn_nuc_labels[...,1] == orphan_label,1] = nuc_info['label'][res[1]]
 
     mn_nuc_labels[...,0] = clear_border(mn_nuc_labels[...,0])
     mn_nuc_labels[...,1] = clear_border(mn_nuc_labels[...,1])
@@ -1802,6 +1827,7 @@ class TrainingDataGenerator:
     self.skip_empty = skip_empty
     self.num_per_image = num_per_image
     self.post_hooks = post_hooks
+    self.use_dist_masks = use_dist_masks
 
     dirs = [ x for x in data_path.iterdir() if x.is_dir() ]
     print("Located {} directories...".format(len(dirs)))
@@ -1864,7 +1890,8 @@ class TrainingDataGenerator:
       for data_point in data_points:
         yield data_point
 
-  def _get_full_mask(self, pn_mask, mn_mask):
+  @staticmethod
+  def get_full_mask(pn_mask, mn_mask):
     full_mask = np.zeros((pn_mask.shape[0], pn_mask.shape[1], 3), dtype=np.uint16)
     pn_colors = np.unique(np.reshape(pn_mask, (pn_mask.shape[0]*pn_mask.shape[1],4)), axis=0)
     mn_colors = np.unique(np.reshape(mn_mask, (mn_mask.shape[0]*mn_mask.shape[1],4)), axis=0)
@@ -1886,7 +1913,7 @@ class TrainingDataGenerator:
     pn_mask = np.array(Image.open(pn_mask_path))
     mn_mask = np.array(Image.open(mn_mask_path))
 
-    full_mask = self._get_full_mask(pn_mask, mn_mask)
+    full_mask = TrainingDataGenerator.get_full_mask(pn_mask, mn_mask)
 
     hulls = np.zeros((full_mask.shape[0], full_mask.shape[1])).astype(np.uint16)
     distances = np.zeros((full_mask.shape[0], full_mask.shape[1], 2)).astype(np.float64)
@@ -2171,7 +2198,7 @@ class TFData(Sequence):
   """
   Provides training and validation data during training
   """
-  def __init__(self, crop_size, data_path, batch_size, num_per_image, use_dist_masks=False, **kwargs):
+  def __init__(self, crop_size, data_path, batch_size, num_per_image, use_dist_masks=False, workers=1, use_multiprocessing=False, max_queue_size=10, **kwargs):
     """
     Load a TrainingDataGenerator class
 
@@ -2186,6 +2213,8 @@ class TFData(Sequence):
     num_per_image : int
       The number of crops to generate / image
     """
+    super().__init__(workers=1, use_multiprocessing=False, max_queue_size=10)
+
     self.dg = TrainingDataGenerator(
       crop_size,
       data_path,

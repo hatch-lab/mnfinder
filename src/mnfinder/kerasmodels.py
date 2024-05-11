@@ -1,10 +1,22 @@
 import tensorflow as tf
 import tensorflow.keras.layers as nn
 from tensorflow.keras import Model
+from importlib.metadata import version
 
 # Adapted from 
 # https://github.com/lixiaolei1982/Keras-Implementation-of-U-Net-R2U-Net-Attention-U-Net-Attention-R2U-Net.-/blob/master/network.py
 class AttentionUNet:
+
+  def get_tf_version(self):
+    tf_version = version('tensorflow').split('.')
+    return int(tf_version[0]), int(tf_version[1])
+
+  def _get_shape(self, tensor):
+    if self.get_tf_version()[1] < 16:
+      return tensor.get_shape().as_list()
+    else:
+      return tensor.shape
+
   """
   Builds a standard U-Net with attention in the up-blocks
   """
@@ -81,9 +93,9 @@ class AttentionUNet:
       The concatenated up-sampled and skip-connection layers
     """
     if data_format == 'channels_first':
-      in_channel = down_layer.get_shape().as_list()[1]
+      in_channel = self._get_shape(down_layer)[1]
     else:
-      in_channel = down_layer.get_shape().as_list()[3]
+      in_channel = self._get_shape(down_layer)[3]
 
     # up = Conv2DTranspose(out_channel, [2, 2], strides=[2, 2])(down_layer)
     up = nn.UpSampling2D(size=(2, 2), data_format=data_format)(down_layer)
@@ -177,10 +189,10 @@ class MSAttentionUNet(AttentionUNet):
     features = 64
     skips = []
     for i in range(depth-1):
-      x = self.ms_down_block(x, features, 'channels_last')
+      x = self._ms_down_block(x, features, 'channels_last')
       skips.append(x)
       features *= 2
-    x = self.ms_down_block(x, features, 'channels_last')
+    x = self._ms_down_block(x, features, 'channels_last')
     features *= 2
 
     # Bottleneck
@@ -206,7 +218,7 @@ class MSAttentionUNet(AttentionUNet):
 
     return model
 
-  def ms_down_block(self, x, features, data_format='channels_last'):
+  def _ms_down_block(self, x, features, data_format='channels_last'):
     """
     Build the multi-scale down block
 
