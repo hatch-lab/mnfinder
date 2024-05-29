@@ -69,7 +69,7 @@ class AttentionUNet:
       x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
 
     conv6 = nn.Conv2D(num_output_classes, (1, 1), padding='same', data_format='channels_last')(x)
-    conv7 = nn.Activation('sigmoid')(conv6)
+    conv7 = nn.Activation('softmax')(conv6)
     model = Model(inputs=inputs, outputs=conv7)
 
     return model
@@ -213,7 +213,7 @@ class MSAttentionUNet(AttentionUNet):
     x = nn.Conv2D(features, (3,3), padding='same', activation='relu',)(x)
 
     conv6 = nn.Conv2D(num_output_classes, (1, 1), padding='same', data_format='channels_last')(x)
-    conv7 = nn.Activation('sigmoid')(conv6)
+    conv7 = nn.Activation('softmax')(conv6)
     model = Model(inputs=inputs, outputs=conv7)
 
     return model
@@ -447,3 +447,67 @@ class SegmenterUNet(AttentionUNet):
 
     return x
 
+
+class CombinedUNet(AttentionUNet):
+  """
+  Builds a standard U-Net with attention in the up-blocks
+  """
+  def build(self, base_model, adj_model, crop_size, num_input_channels, num_output_classes=3, depth=4):
+    """
+    Build and return the network model
+
+    Input assumes channels are last, with image shapes being
+    (crop_size, crop_size, num_input_channels)
+
+    Parameters
+    --------
+    base_model : Model
+      The base model to generate predictions. BG and nuclei weights will be taken from this model
+    adj_model : Model
+      The adjusting model, combined with base_model MN weights
+    crop_size : int
+      The width and height of each image
+    num_input_channels : int
+      The number of channels
+    depth : int
+      The depth of the neural net
+    
+    Returns
+    --------
+    tf.keras.Model
+      The built model
+    """
+    inputs = nn.Input(( crop_size, crop_size, num_input_channels ))
+    
+    x1 = base_model(inputs, training=False)
+    x2 = adj_model(inputs, training=False)
+
+    x = nn.Concatenate()([x1,x2])
+
+    features = 64
+    skips = []
+    for i in range(depth):
+      x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
+      x = nn.Dropout(0.2)(x)
+      x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
+      skips.append(x)
+      x = nn.MaxPooling2D((2, 2), data_format='channels_last')(x)
+      features *= 2
+
+    # Bottleneck
+    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')(x)
+    x = nn.Dropout(0.2)(x)
+    x = nn.Conv2D(features, (3,3), activation='relu', padding='same', data_format='channels_last')(x)
+
+    for i in reversed(range(depth)):
+      features = features // 2
+      x = self._attention_up_and_concat(x, skips[i], data_format='channels_last')
+      x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
+      x = nn.Dropout(0.2)(x)
+      x = nn.Conv2D(features, (3, 3), activation='relu', padding='same', data_format='channels_last')(x)
+
+    conv6 = nn.Conv2D(num_output_classes, (1, 1), padding='same', data_format='channels_last')(x)
+    conv7 = nn.Activation('softmax')(conv6)
+    model = Model(inputs=inputs, outputs=conv7)
+
+    return model

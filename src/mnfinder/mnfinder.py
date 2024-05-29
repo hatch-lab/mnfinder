@@ -32,7 +32,7 @@ from cdBoundary.boundary import ConcaveHull
 from scipy.ndimage import distance_transform_edt
 from scipy import spatial
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 dirs = PlatformDirs("MNFinder", "Hatch-Lab", __version__)
 Path(dirs.user_data_dir).parent.mkdir(exist_ok=True)
 Path(dirs.user_data_dir).mkdir(exist_ok=True)
@@ -511,12 +511,12 @@ class MNModel:
       Where the model weights are stored. If None, defaults to models/[model_name]/final.weights.h5
     """
     if weights_path is None:
-      weights_path = self.models_root / type(self).__name__
+      weights_path = self._get_path() / "final.weights.h5"
     else:
       weights_path = Path(weights_path).resolve()
 
     model_gzip_path = self.models_root / (type(self).__name__ + ".tar.gz")
-    if not weights_path.exists():
+    if not weights_path.exists() and not (weights_path.parent / (weights_path.name + ".index")).exists():
       # Try to download
       r = requests.get(self.model_url, allow_redirects=True, stream=True)
 
@@ -542,16 +542,16 @@ class MNModel:
 
     self.trained_model = self._build_model()
     if self.get_tf_version()[1] < 16:
-      self.trained_model.load_weights(self._get_path() / "final.weights.h5", skip_mismatch=True, by_name=True)
+      self.trained_model.load_weights(weights_path, skip_mismatch=True, by_name=True)
     else:
-      self.trained_model.load_weights(self._get_path() / "final.weights.h5", skip_mismatch=True)
+      self.trained_model.load_weights(weights_path, skip_mismatch=True)
 
   def _get_field_predictions(self, img):
     coords, dataset, predictions = self._get_mn_predictions(img)
     num_channels = predictions[0].shape[2]
     field_output = np.zeros(( img.shape[0], img.shape[1], num_channels ), dtype=np.float64)
 
-    for idx, batch in enumerate(dataset):
+    for idx in range(len(dataset)):
       field_output = self._blend_crop(field_output, predictions[idx], coords[idx])
 
     return field_output
@@ -991,7 +991,7 @@ class MNModel:
     save_weights : bool
       Whether to save the model weights
     save_path : str|Path|None
-      Where to save model weights. If None, will default to modesl/[model_name]
+      Where to save model weights. If None, will default to models/[model_name]
     load_weights : str|Path|None
       If weights should be loaded prior to training, weights at the path specified by load_weights will be used
 
@@ -1067,6 +1067,8 @@ class MNModel:
     if save_weights:
       if save_path is None:
         save_path = self.models_root / type(self).__name__ / "final.weights.h5"
+      elif not re.match(r"weights\.h5$", Path(save_path).name):
+        raise Exception("`save_path` must end in weights.h5")
 
       model.save_weights(str(save_path))
 
@@ -1216,7 +1218,7 @@ class MNClassifier(MNModel):
       classifiers = sys.modules['mnfinder.classifiers']
     else:
       classifiers = importlib.import_module('mnfinder.classifiers')
-    available_models = [ x[0] for x in inspect.getmembers(classifiers, inspect.isclass) if hasattr(x[1], 'class_type') and x[1].class_type == "classifier" ]
+    available_models = [ x[0] for x in inspect.getmembers(classifiers, inspect.isclass) if hasattr(x[1], 'class_type') and x[1].class_type == "classifier" and x[0] != "MNClassifier"]
     return available_models
 
   @staticmethod
@@ -1238,7 +1240,7 @@ class MNClassifier(MNModel):
     return model_name in MNClassifier.get_available_models()
 
   @staticmethod
-  def get_model(model_name='Attention', weights_path=None, trained_model=None):
+  def get_model(model_name='Combined', weights_path=None, trained_model=None):
     """
     Returns an instance of the given model
 
@@ -1247,7 +1249,7 @@ class MNClassifier(MNModel):
     Parameters
     --------
     model_name : str
-      The model name. Defaults to the Attention class
+      The model name. Defaults to the Combined class
     weights_path : Path|str|None
       Where to load the weights. If None, will load pretrained weights
     trained_model : tf.keras.Model|None
@@ -1538,6 +1540,8 @@ class MNSegmenter(MNModel):
     Build and train a model from scratch
   """
 
+  class_type = "segmenter"
+
   @staticmethod
   def get_available_models():
     """
@@ -1553,7 +1557,7 @@ class MNSegmenter(MNModel):
       segmenters = sys.modules['mnfinder.segmenters']
     else:
       segmenters = importlib.import_module('mnfinder.segmenters')
-    available_models = [ x[0] for x in inspect.getmembers(segmenters, inspect.isclass) if issubclass(x[1], MNSegmenter) ]
+    available_models = [ x[0] for x in inspect.getmembers(segmenters, inspect.isclass) if hasattr(x[1], 'class_type') and x[1].class_type == "segmenter" and x[0] != "MNSegmenter" ]
     return available_models
 
   @staticmethod
