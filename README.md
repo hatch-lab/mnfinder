@@ -38,29 +38,11 @@ The default network is an Attention U-Net that was trained on 128x128 crops.
 **Defaults**
 * `skip_opening`: `False`
 * `expand_masks`: `True`
-* `use_argmax`: `False`
-* `opening_radius`: 1
-
-#### Attention96
-An Attention U-Net trained on 96x96 crops.
-
-**Defaults**
-* `skip_opening`: `False`
-* `expand_masks`: `True`
 * `use_argmax`: `True`
-* `opening_radius`: 2
+* `opening_radius`: 1
 
 #### MSAttention
 This is a modification of the Attention U-Net that incorporates a multi-scale convolution in the down blocks.
-
-**Defaults**
-* `skip_opening`: `False`
-* `expand_masks`: `True`
-* `use_argmax`: `False`
-* `opening_radius`: 1
-
-#### MSAttention96
-A multiscale Attention U-Net trained on 96x96 crops.
 
 **Defaults**
 * `skip_opening`: `False`
@@ -74,7 +56,7 @@ An Attention U-Net trained on the micronucleus output of `Attention` and `MSAtte
 **Defaults**
 * `skip_opening`: `False`
 * `expand_masks`: `True`
-* `use_argmax`: `False`
+* `use_argmax`: `True`
 * `opening_radius`: 1
 
 #### LaplaceDeconstruction

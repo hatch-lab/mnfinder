@@ -32,7 +32,7 @@ from cdBoundary.boundary import ConcaveHull
 from scipy.ndimage import distance_transform_edt
 from scipy import spatial
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 dirs = PlatformDirs("MNFinder", "Hatch-Lab", __version__)
 Path(dirs.user_data_dir).parent.mkdir(exist_ok=True)
 Path(dirs.user_data_dir).mkdir(exist_ok=True)
