@@ -240,11 +240,11 @@ class Combined(MNClassifier):
     self.fg_min = 0.05
 
   def _build_model(self):
-    a = Attention()
+    a = MNClassifier.get_model('Attention')
     base_model = a.trained_model
     base_model.trainable = False
 
-    m = MSAttention()
+    m = MNClassifier.get_model('MSAttention')
     adj_model = m.trained_model
     adj_model.trainable = False
 

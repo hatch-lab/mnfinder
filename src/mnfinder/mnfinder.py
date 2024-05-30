@@ -388,8 +388,8 @@ class MNModel:
             pred_overlap/np.sum(idx)
           )
           pred_mn_df['true_ids'].append(np.unique(full_mask[(idx) & (full_mask[...,2] != 0),2]))
-          cell_ids = np.unique(full_mask[(idx) & (full_mask[...,1] != 0),1])
-          if np.intersect1d(full_mask[(labels[...,0] == cell_label),0], cell_ids).shape[0] > 0:
+          cell_ids = np.unique(full_mask[(idx) & (full_mask[...,2] != 0),1])
+          if np.intersect1d(full_mask[(labels[...,0] == cell_label),1], cell_ids).shape[0] > 0:
             pred_mn_df['correctly_assigned'].append(True)
           else:
             pred_mn_df['correctly_assigned'].append(False)
