@@ -96,3 +96,9 @@ Labels are returned as a 3-channel image. Channel 1 contains the unique cell lab
 
 `return_raw_output=bool`
 : If you wish to examine the fields returned by the semantic and instance classifier neural nets, set this to `True`.
+
+### Prediction info
+````
+mn_df, nuc_df = MNClassifier.get_label_data(labels)
+````
+Provides some basic information about each MN and nuclear label predicted.
