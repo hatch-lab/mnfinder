@@ -32,8 +32,9 @@ from cdBoundary.boundary import ConcaveHull
 from scipy.ndimage import distance_transform_edt
 from scipy import spatial
 
-__version__ = "1.2.1"
-dirs = PlatformDirs("MNFinder", "Hatch-Lab", __version__)
+__version__ = "1.2.2"
+__model_version__ = "1.2.1"
+dirs = PlatformDirs("MNFinder", "Hatch-Lab", __model_version__)
 Path(dirs.user_data_dir).parent.mkdir(exist_ok=True)
 Path(dirs.user_data_dir).mkdir(exist_ok=True)
 
@@ -222,6 +223,58 @@ class MNModel:
     if len(img.shape) == 2:
       return np.stack([ img ], axis=-1)
     raise IncorrectDimensions()
+
+  @staticmethod
+  def get_label_data(labels):
+    """
+    Generates pd.DataFrames with various metrics on the predicted labels
+
+    Static method
+
+    Parameters
+    --------
+    labels : np.array
+      The predicted labels from MNClassifier.predict()
+
+    Returns
+    --------
+    pd.DataFrame
+      Information about each MN prediction
+    pd.DataFrame
+      Information about each nucleus prediction
+    pd.DataFrame
+      Summary statistics
+    """
+    pred_mn_df = {
+      'mn_label': [], # The prediction label
+      'cell_label': [], 
+      'area': [] # The area in square pixels
+    }
+
+    pred_nuc_df = {
+      'cell_label': [],
+      'area': []
+    }
+
+    # Pred stats
+    for cell_label in np.unique(labels[labels[...,0] != 0, 0]):
+      for mn_label in np.unique(labels[labels[...,1] == cell_label,2]):
+        pred_mn_df['mn_label'].append(mn_label)
+        pred_mn_df['cell_label'].append(cell_label)
+        
+        idx = (labels[...,2] == mn_label)
+
+        pred_mn_df['area'].append(np.sum(idx))
+
+      pred_nuc_df['cell_label'].append(cell_label)
+      idx = (labels[...,0] == cell_label)
+
+      pred_nuc_df['area'].append(np.sum(idx))
+      
+    pred_mn_df = pd.DataFrame(pred_mn_df)
+    pred_nuc_df = pd.DataFrame(pred_nuc_df)
+
+    return pred_mn_df, pred_nuc_df
 
   @staticmethod
   def eval_mn_prediction(full_mask, labels):
