@@ -32,7 +32,7 @@ from cdBoundary.boundary import ConcaveHull
 from scipy.ndimage import distance_transform_edt
 from scipy import spatial
 
-__version__ = "1.2.2"
+__version__ = "1.2.3"
 __model_version__ = "1.2.1"
 dirs = PlatformDirs("MNFinder", "Hatch-Lab", __model_version__)
 Path(dirs.user_data_dir).parent.mkdir(exist_ok=True)
@@ -225,7 +225,7 @@ class MNModel:
     raise IncorrectDimensions()
 
   @staticmethod
-  def get_label_data(labels):
+  def get_label_data(labels, nuc_img=None, mn_img=None, additional_metrics=None):
     """
     Generates pd.DataFrames with various metrics on the predicted labels
 
@@ -235,6 +235,12 @@ class MNModel:
     --------
     labels : np.array
       The predicted labels from MNClassifier.predict()
+    nuc_img : np.array|None
+      Image to use for intensity measurements for nuclei
+    mn_img : np.array|None
+      Image to use for intensity measurements for MN
+    additional_metrics : list|None
+      Additional metrics to request from skimage.measure.regionprops_table
 
     Returns
     --------
@@ -242,42 +248,68 @@ class MNModel:
       Information about each MN prediction
     pd.DataFrame
       Information about each nucleus prediction
-    pd.DataFrame
-      Summary statistics
     """
-    pred_mn_df = {
-      'mn_label': [], # The prediction label
-      'cell_label': [], 
-      'area': [] # The area in square pixels
-    }
+    properties = ['label', 'centroid', 'area']
 
-    pred_nuc_df = {
-      'cell_label': [],
-      'area': []
-    }
+    if additional_metrics is not None and len(additional_metrics) > 0:
+      properties = np.unique(np.concatenate([ properties, additional_metrics ]))
 
     # Pred stats
-    for cell_label in np.unique(labels[labels[...,0] != 0, 0]):
-      for mn_label in np.unique(labels[labels[...,1] == cell_label,2]):
-        pred_mn_df['mn_label'].append(mn_label)
-        pred_mn_df['cell_label'].append(cell_label)
-        
-        idx = (labels[...,2] == mn_label)
+    try:
+      pred_nuc_df = pd.DataFrame(regionprops_table(labels[...,0], nuc_img, properties=properties)).rename(
+        columns={ 
+          'label': 'cell_label', 
+          'centroid-0': 'y',
+          'centroid-1': 'x'
+        }
+      )
+    except AttributeError as e:
+      if "unavailable when `intensity_image` has not been specified" in str(e):
+        raise AttributeError("`nuc_img` is required")
+      else:
+        raise e
 
-        pred_mn_df['area'].append(np.sum(idx))
+    pred_mn_df = []
+    for cell_label in pred_nuc_df['cell_label'].unique():
+      this_cell_x = pred_nuc_df.loc[pred_nuc_df['cell_label'] == cell_label, 'x'].iloc[0]
+      this_cell_y = pred_nuc_df.loc[pred_nuc_df['cell_label'] == cell_label, 'y'].iloc[0]
 
-      pred_nuc_df['cell_label'].append(cell_label)
-      idx = (labels[...,0] == cell_label)
+      this_mn_labels = labels[...,2].copy()
+      this_mn_labels[labels[...,1] != cell_label] = 0
+      try:
+        this_mn_stats = pd.DataFrame(regionprops_table(this_mn_labels, mn_img, properties=properties)).rename(
+          columns={ 
+            'label': 'mn_label', 
+            'centroid-0': 'y',
+            'centroid-1': 'x'
+          }
+        )
+      except AttributeError as e:
+        if "unavailable when `intensity_image` has not been specified" in str(e):
+          raise AttributeError("`mn_img` is required")
+        else:
+          raise e
 
-      pred_nuc_df['area'].append(np.sum(idx))
-      
-    pred_mn_df = pd.DataFrame(pred_mn_df)
-    pred_nuc_df = pd.DataFrame(pred_nuc_df)
+      this_mn_stats['cell_label'] = cell_label
+      this_mn_stats['distance_to_nuc'] = ((this_mn_stats['x']-this_cell_x)**2+(this_mn_stats['y']-this_cell_y)**2)**(1/2)
+      pred_mn_df.append(this_mn_stats)
+    pred_mn_df = pd.concat(pred_mn_df)
+
+    # Put cell label, mn label front
+    mn_cols = list(pred_mn_df.columns)
+    mn_cols.insert(0, mn_cols.pop(mn_cols.index('cell_label')))
+    mn_cols.insert(0, mn_cols.pop(mn_cols.index('mn_label')))
+
+    cell_cols = list(pred_nuc_df.columns) 
+    cell_cols.insert(0, cell_cols.pop(cell_cols.index('cell_label')))
+
+    pred_mn_df = pred_mn_df.loc[:, mn_cols]
+    pred_nuc_df = pred_nuc_df.loc[:, cell_cols]
 
     return pred_mn_df, pred_nuc_df
 
   @staticmethod
-  def eval_mn_prediction(full_mask, labels):
+  def eval_mn_prediction(full_mask, labels, nuc_img=None, mn_img=None, additional_metrics=None):
     """
     Evaluates the results of a prediction against ground truth
 
@@ -299,6 +331,12 @@ class MNModel:
       likely because smaller MN are more likely to rupture
     labels : np.array
       The predicted labels from MNClassifier.predict()
+    nuc_img : np.array|None
+      Image to use for intensity measurements for nuclei
+    mn_img : np.array|None
+      Image to use for intensity measurements for MN
+    additional_metrics : list|None
+      Additional metrics to request from skimage.measure.regionprops_table
       
     Returns
     --------
@@ -317,43 +355,6 @@ class MNModel:
     ruptured_mn = np.zeros(( full_mask.shape[0], full_mask.shape[1] ), dtype=np.uint16)
     intact_mn[(full_mask[...,0] == 2)] = 1
     ruptured_mn[(full_mask[...,0] == 3)] = 1
-
-    mn_df = {
-      'mn_id': [], # The real MN label
-      'cell_id': [], # Cell ID
-      'intact': [], # If this MN is intact or ruptured
-      'found': [], # If any portion of this segment overlapped with 1 or more predictions
-      'area': [], # The area in square pixels
-      'proportion_segmented': [], # The amount of overlap between prediction and truth
-      'pred_labels': [], # The label IDs of any predictions that overlap
-      'pred_cell_labels': []
-    }
-
-    pred_mn_df = {
-      'mn_label': [], # The prediction label
-      'cell_label': [], 
-      'exists': [], # If any portion of this prediction overlapped with 1 or more real MN
-      'area': [], # The area in square pixels
-      'proportion_true': [], # The proportion of overlap between prediction and truths
-      'true_ids': [], # The label IDs of any true MN that overlap
-      'correctly_assigned': [] # If this MN is assigned to the correct nucleus
-    }
-
-    nuc_df = {
-      'cell_id': [],
-      'found': [],
-      'area': [],
-      'proportion_segmented': [],
-      'pred_labels': []
-    }
-
-    pred_nuc_df = {
-      'cell_label': [],
-      'exists': [],
-      'area': [],
-      'proportion_true': [],
-      'true_ids': []
-    }
 
     summary_df = {
       'num_mn': [], # The number of MN in this image
@@ -379,110 +380,90 @@ class MNModel:
     # Summary also contains PPV and and recall statistics
 
     # True stats
-    full_mask[...,0] = clear_border(full_mask[...,0])
-    full_mask[...,1] = clear_border(full_mask[...,1])
-    full_mask[...,2] = clear_border(full_mask[...,2])
-    for cell_id in np.unique(full_mask[(full_mask[...,1] != 0),1]):
-      for mn_id in np.unique(full_mask[(full_mask[...,1] == cell_id) & (full_mask[...,2] != 0),2]):
-        mn_df['mn_id'].append(mn_id)
-        mn_df['cell_id'].append(cell_id)
+    true_labels = np.zeros_like(full_mask)
+    true_labels[...,0] = clear_border(full_mask[...,1]).copy()
+    true_labels[...,1] = clear_border(full_mask[...,1]).copy()
+    true_labels[...,2] = clear_border(full_mask[...,2]).copy()
+
+    true_labels[...,0][full_mask[...,2] != 0] = 0 # Clear out MN
+    true_labels[...,1][full_mask[...,2] == 0] = 0 # Clear out Nuc
+
+    true_mn_df, true_nuc_df = MNClassifier.get_label_data(true_labels, nuc_img, mn_img, additional_metrics)
+    pred_mn_df, pred_nuc_df = MNClassifier.get_label_data(labels, nuc_img, mn_img, additional_metrics)
+
+    # Extra info to add
+    true_mn_df['intact'] = True # If this MN is intact or ruptured
+    true_mn_df['found'] = False # If any portion of this segment overlapped with 1 or more predictions
+    true_mn_df['proportion_segmented'] = 0.0 # The amount of overlap between prediction and truth
+    true_mn_df['pred_labels'] = "" # The label IDs of any predictions that overlap
+    true_mn_df['pred_cell_labels'] = ""
+
+    pred_mn_df['exists'] = False # If any portion of this prediction overlapped with 1 or more real MN
+    pred_mn_df['proportion_true'] = 0.0 # The proportion of overlap between prediction and truths
+    pred_mn_df['true_ids'] = "" # The label IDs of any true MN that overlap
+    pred_mn_df['correctly_assigned'] = False # If this MN is assigned to the correct nucleus
+
+    true_nuc_df['found'] = False
+    true_nuc_df['proportion_segmented'] = 0.0 
+    true_nuc_df['pred_labels'] = ""
+
+    pred_nuc_df['exists'] = False
+    pred_nuc_df['proportion_true'] = 0.0
+    pred_nuc_df['true_ids'] = ""
+
+    for cell_id in true_nuc_df['cell_label'].unique():
+      mn_ids = true_mn_df.loc[true_mn_df['cell_label'] == cell_id, 'mn_label'].unique()
+      for mn_id in mn_ids:
         idx = (full_mask[...,2] == mn_id)
         if np.sum(intact_mn[idx]) > 0:
-          mn_df['intact'].append(True)
-        else:
-          mn_df['intact'].append(False)
-
-        mn_df['area'].append(np.sum(idx))
+          true_mn_df.loc[true_mn_df['mn_label'] == mn_id, 'intact'] = True
 
         pred_overlap = np.sum(np.logical_and(idx, labels[...,2] > 0))
         if pred_overlap > 0:
-          mn_df['found'].append(True)
-          mn_df['proportion_segmented'].append(
-            pred_overlap/np.sum(idx)
-          )
-          mn_df['pred_labels'].append(np.unique(labels[(idx) & (labels[...,2] != 0),2]))
-          mn_df['pred_cell_labels'].append(np.unique(labels[(idx) & (labels[...,1] != 0),1]))
-        else:
-          mn_df['found'].append(False)
-          mn_df['proportion_segmented'].append(0.)
-          mn_df['pred_labels'].append([])
-          mn_df['pred_cell_labels'].append([])
-
-      nuc_df['cell_id'].append(cell_id)
+          true_mn_df.loc[true_mn_df['mn_label'] == mn_id, 'found'] = True
+          true_mn_df.loc[true_mn_df['mn_label'] == mn_id, 'proportion_segmented'] = pred_overlap/np.sum(idx)
+          true_mn_df.loc[true_mn_df['mn_label'] == mn_id, 'pred_labels'] = ",".join(np.unique(labels[(idx) & (labels[...,2] != 0),2]).astype(str))
+          true_mn_df.loc[true_mn_df['mn_label'] == mn_id, 'pred_cell_labels'] = ",".join(np.unique(labels[(idx) & (labels[...,1] != 0),1]).astype(str))
+      
       idx = (full_mask[...,1] == cell_id)
-
-      nuc_df['area'].append(np.sum(idx))
       pred_overlap = np.sum(np.logical_and(idx, labels[...,0] > 0))
       if pred_overlap > 0:
-        nuc_df['found'].append(True)
-        nuc_df['proportion_segmented'].append(
-          pred_overlap/np.sum(idx)
-        )
-        nuc_df['pred_labels'].append(np.unique(labels[(idx) & (labels[...,0] != 0),0]))
-      else:
-        nuc_df['found'].append(False)
-        nuc_df['proportion_segmented'].append(0.)
-        nuc_df['pred_labels'].append([])
+        true_nuc_df.loc[true_nuc_df['cell_label'] == cell_id, 'found'] = True
+        true_nuc_df.loc[true_nuc_df['cell_label'] == cell_id, 'proportion_segmented'] = pred_overlap/np.sum(idx)
+        true_nuc_df.loc[true_nuc_df['cell_label'] == cell_id, 'pred_labels'] = ",".join(np.unique(labels[(idx) & (labels[...,0] != 0),0]).astype(str))
 
-    # Pred stats
-    for cell_label in np.unique(labels[labels[...,0] != 0, 0]):
-      for mn_label in np.unique(labels[labels[...,1] == cell_label,2]):
-        pred_mn_df['mn_label'].append(mn_label)
-        pred_mn_df['cell_label'].append(cell_label)
-        
-        idx = (labels[...,2] == mn_label)
-
-        pred_mn_df['area'].append(np.sum(idx))
+    for cell_id in pred_nuc_df['cell_label'].unique():
+      mn_ids = pred_mn_df.loc[pred_mn_df['cell_label'] == cell_id, 'mn_label'].unique()
+      for mn_id in mn_ids:
+        idx = (labels[...,2] == mn_id)
 
         pred_overlap = np.sum(np.logical_and(idx, full_mask[...,2] > 0))
         if pred_overlap > 0:
-          pred_mn_df['exists'].append(True)
-          pred_mn_df['proportion_true'].append(
-            pred_overlap/np.sum(idx)
-          )
-          pred_mn_df['true_ids'].append(np.unique(full_mask[(idx) & (full_mask[...,2] != 0),2]))
+          pred_mn_df.loc[pred_mn_df['mn_label'] == mn_id, 'exists'] = True
+          pred_mn_df.loc[pred_mn_df['mn_label'] == mn_id, 'proportion_true'] = pred_overlap/np.sum(idx)
+          pred_mn_df.loc[pred_mn_df['mn_label'] == mn_id, 'true_ids'] = ",".join(np.unique(full_mask[(idx) & (full_mask[...,2] != 0),2]).astype(str))
+
           cell_ids = np.unique(full_mask[(idx) & (full_mask[...,2] != 0),1])
-          if np.intersect1d(full_mask[(labels[...,0] == cell_label),1], cell_ids).shape[0] > 0:
-            pred_mn_df['correctly_assigned'].append(True)
-          else:
-            pred_mn_df['correctly_assigned'].append(False)
-        else:
-          pred_mn_df['exists'].append(False)
-          pred_mn_df['proportion_true'].append(0.)
-          pred_mn_df['true_ids'].append([])
-          pred_mn_df['correctly_assigned'].append(False)
+          if np.intersect1d(full_mask[(labels[...,0] == cell_id),1], cell_ids).shape[0] > 0:
+            pred_mn_df.loc[pred_mn_df['mn_label'] == mn_id, 'correctly_assigned'] = True
 
-      pred_nuc_df['cell_label'].append(cell_label)
-      idx = (labels[...,0] == cell_label)
-
-      pred_nuc_df['area'].append(np.sum(idx))
+      idx = (labels[...,0] == cell_id)
       pred_overlap = np.sum(np.logical_and(idx, full_mask[...,0] > 0))
       if pred_overlap > 0:
-        pred_nuc_df['exists'].append(True)
-        pred_nuc_df['proportion_true'].append(
-          pred_overlap/np.sum(idx)
-        )
-        pred_nuc_df['true_ids'].append(np.unique(full_mask[(idx) & (full_mask[...,1] != 0),1]))
-      else:
-        pred_nuc_df['exists'].append(False)
-        pred_nuc_df['proportion_true'].append(0.)
-        pred_nuc_df['true_ids'].append([])
+        pred_nuc_df.loc[pred_nuc_df['cell_label'] == cell_id, 'exists'] = True
+        pred_nuc_df.loc[pred_nuc_df['cell_label'] == cell_id, 'proportion_true'] = pred_overlap/np.sum(idx)
+        pred_nuc_df.loc[pred_nuc_df['cell_label'] == cell_id, 'true_ids'] = ",".join(np.unique(full_mask[(idx) & (full_mask[...,1] != 0),1]).astype(str))
 
-    mn_df = pd.DataFrame(mn_df)
-    pred_mn_df = pd.DataFrame(pred_mn_df)
-    nuc_df = pd.DataFrame(nuc_df)
-    pred_nuc_df = pd.DataFrame(pred_nuc_df)
-
-    summary_df['num_mn'].append(mn_df.shape[0])
-    summary_df['num_nuclei'].append(nuc_df.shape[0])
-    summary_df['num_intact_mn'].append(np.sum(mn_df['intact']))
-    summary_df['num_ruptured_mn'].append(mn_df.shape[0]-np.sum(mn_df['intact']))
+    summary_df['num_mn'].append(true_mn_df.shape[0])
+    summary_df['num_nuclei'].append(true_nuc_df.shape[0])
+    summary_df['num_intact_mn'].append(np.sum(true_mn_df['intact']))
+    summary_df['num_ruptured_mn'].append(true_mn_df.shape[0]-np.sum(true_mn_df['intact']))
     summary_df['num_mn_predictions'].append(pred_mn_df.shape[0])
     summary_df['num_nuclei_predictions'].append(pred_nuc_df.shape[0])
-    summary_df['num_mn_found'].append(np.sum(mn_df['found']))
-    summary_df['num_nuclei_found'].append(np.sum(nuc_df['found']))
-    summary_df['num_intact_mn_found'].append(np.sum(mn_df.loc[mn_df['intact'] == True, 'found']))
-    summary_df['num_ruptured_mn_found'].append(np.sum(mn_df.loc[mn_df['intact'] == False, 'found']))
+    summary_df['num_mn_found'].append(np.sum(true_mn_df['found']))
+    summary_df['num_nuclei_found'].append(np.sum(true_nuc_df['found']))
+    summary_df['num_intact_mn_found'].append(np.sum(true_mn_df.loc[true_mn_df['intact'] == True, 'found']))
+    summary_df['num_ruptured_mn_found'].append(np.sum(true_mn_df.loc[true_mn_df['intact'] == False, 'found']))
 
     mn_intersection = np.sum(np.logical_and((full_mask[...,2] > 0), (labels[...,2] > 0)))
     mn_union = np.sum(np.logical_or((full_mask[...,2] > 0), (labels[...,2] > 0)))
@@ -520,7 +501,7 @@ class MNModel:
     summary_df['intact_recall'] = summary_df['num_intact_mn_found']/summary_df['num_intact_mn']
     summary_df['ruptured_recall'] = summary_df['num_ruptured_mn_found']/summary_df['num_ruptured_mn']
 
-    return mn_df, nuc_df, pred_mn_df, pred_nuc_df, summary_df
+    return true_mn_df, true_nuc_df, pred_mn_df, pred_nuc_df, summary_df
 
   crop_size = 128
   oversample_ratio = 0.25

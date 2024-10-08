@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnfinder"
-version = "1.2.2"
+version = "1.2.3"
 authors = [{ name = "Lucian DiPeso", email="ldipeso@uw.edu" }]
 description = "A package for segmenting micronuclei in microscopy images"
 readme = "README.md"
