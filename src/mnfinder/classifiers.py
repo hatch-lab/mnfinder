@@ -1,4 +1,4 @@
-from .mnfinder import MNClassifier, MNModelDefaults
+from .mnfinder import MNClassifier, MNModelDefaults, TFData
 from .kerasmodels import AttentionUNet, MSAttentionUNet, CombinedUNet
 import tensorflow as tf
 import numpy as np
@@ -250,3 +250,44 @@ class Combined(MNClassifier):
 
     factory = CombinedUNet()
     return factory.build(base_model, adj_model, self.crop_size, 2)
+
+class AttentionMNLike(MNClassifier):
+  """
+  A basic U-Net with additional attention modules in the decoder.
+
+  Trained on single-channel images + Sobel
+  """
+  # model_url = 'https://fh-pi-hatch-e-eco-public.s3.us-west-2.amazonaws.com/mn-segmentation/models/Attention.tar.gz'
+
+  crop_size = 128
+  bg_max = 0.59
+  fg_min = 0.24
+
+  def __init__(self, weights_path=None, trained_model=None):
+    super().__init__(weights_path=weights_path, trained_model=trained_model)
+    self.defaults.use_argmax = True
+
+  def _build_model(self):
+    factory = AttentionUNet()
+    return factory.build(self.crop_size, 2, 4)
+
+  def _get_trainer(self, data_path, batch_size, num_per_image, augment=True):
+    """
+    Return a trainer
+
+    Parameters
+    --------
+    data_path : Path|str|None
+      The path to the data sets
+    batch_size : int
+      Training batch size
+    num_per_image : int
+      The number of crops to return per training image
+    augment : bool
+      Whether to use image augmentation
+
+    Returns
+    --------
+    tf.keras.utils.Sequence
+    """
+    return TFData(self.crop_size, data_path, batch_size, num_per_image, augment=augment, use_mn_like=True)

@@ -27,6 +27,7 @@ from platformdirs import PlatformDirs
 import inspect
 import importlib
 from importlib.metadata import version
+import re
 
 from cdBoundary.boundary import ConcaveHull
 from scipy.ndimage import distance_transform_edt
@@ -515,8 +516,8 @@ class MNModel:
 
     Parameters
     --------
-    weights_path : str|Path|None
-      Where the model weights are stored. If None, defaults to models/[model_name]
+    weights_path : str|Path|None|False
+      Where the model weights are stored. If None, defaults to models/[model_name]/final.weights.h5. If False, no weights are loaded
     trained_model : tf.keras.Model|None
       If we wish to supply your own trained model, otherwise it will be loaded
     """
@@ -541,16 +542,16 @@ class MNModel:
 
     Parameters
     --------
-    weights_path : str|Path|None
+    weights_path : str|Path|None|False.
       Where the model weights are stored. If None, defaults to models/[model_name]/final.weights.h5
     """
     if weights_path is None:
       weights_path = self._get_path() / "final.weights.h5"
-    else:
+    elif weights_path is not False:
       weights_path = Path(weights_path).resolve()
 
     model_gzip_path = self.models_root / (type(self).__name__ + ".tar.gz")
-    if not weights_path.exists() and not (weights_path.parent / (weights_path.name + ".index")).exists():
+    if weights_path is not False and not weights_path.exists() and not (weights_path.parent / (weights_path.name + ".index")).exists():
       # Try to download
       r = requests.get(self.model_url, allow_redirects=True, stream=True)
 
@@ -575,10 +576,11 @@ class MNModel:
       model_gzip_path.unlink()
 
     self.trained_model = self._build_model()
-    if self.get_tf_version()[1] < 16:
-      self.trained_model.load_weights(weights_path, skip_mismatch=True, by_name=True)
-    else:
-      self.trained_model.load_weights(weights_path, skip_mismatch=True)
+    if weights_path is not False:
+      if self.get_tf_version()[1] < 16:
+        self.trained_model.load_weights(weights_path, skip_mismatch=True, by_name=True)
+      else:
+        self.trained_model.load_weights(weights_path, skip_mismatch=True)
 
   def _get_field_predictions(self, img):
     coords, dataset, predictions = self._get_mn_predictions(img)
@@ -1051,6 +1053,9 @@ class MNModel:
     if checkpoint_path is not None:
       checkpoint_path = Path(checkpoint_path) / (type(self).__name__ + "-" + datetime.today().strftime('%Y-%m-%d') + "-{epoch:04d}.ckpt")
 
+    if save_weights and save_path is not None and not re.match(r"weights\.h5$", Path(save_path).name):
+        raise Exception("`save_path` must end in weights.h5")
+
     metrics = self._get_custom_metrics()
     metric_funs = [ fun for k,fun in metrics.items() if k != "K" ]
     metric_funs.append("accuracy")
@@ -1101,9 +1106,7 @@ class MNModel:
     if save_weights:
       if save_path is None:
         save_path = self.models_root / type(self).__name__ / "final.weights.h5"
-      elif not re.match(r"weights\.h5$", Path(save_path).name):
-        raise Exception("`save_path` must end in weights.h5")
-
+      
       model.save_weights(str(save_path))
 
     return model, model_history
@@ -1831,7 +1834,7 @@ class TrainingDataGenerator:
   crop_image(img_idx=int)
     Generates crops of both images and masks
   """
-  def __init__(self, crop_size, data_path, augment=False, draw_border=False, skip_empty=True, num_per_image=None, use_dist_masks=False, post_hooks=None):
+  def __init__(self, crop_size, data_path, augment=False, draw_border=False, skip_empty=True, num_per_image=None, use_dist_masks=False, post_hooks=None, use_mn_like=False):
     """
     Constructor
     
@@ -1866,22 +1869,26 @@ class TrainingDataGenerator:
     self.num_per_image = num_per_image
     self.post_hooks = post_hooks
     self.use_dist_masks = use_dist_masks
+    self.use_mn_like = use_mn_like
 
     dirs = [ x for x in data_path.iterdir() if x.is_dir() ]
     print("Located {} directories...".format(len(dirs)))
 
     self.image_paths = []
     self.mn_masks_paths = []
+    self.mn_like_masks_paths = []
     self.pn_masks_paths = []
 
     self.distance_masks = {}
 
     mn_mask_dir_name = "mn_masks"
+    mn_like_mask_dir_name = "mn_like_masks"
     pn_mask_dir_name = "nucleus_masks"
     image_dir_name = "images"
 
     for d in tqdm(dirs):
       mask_dir = d / mn_mask_dir_name
+      mn_like_mask_dir = d / mn_like_mask_dir_name
       pn_dir = d / pn_mask_dir_name
       image_dir = d / image_dir_name
 
@@ -1889,6 +1896,7 @@ class TrainingDataGenerator:
 
       for x in mask_list:
         self.mn_masks_paths.append(mask_dir / x.name)
+        self.mn_like_masks_paths.append(mn_like_mask_dir / x.name)
         self.pn_masks_paths.append(pn_dir / x.name)
         self.image_paths.append(image_dir / (x.stem + ".tif"))
         if use_dist_masks:
@@ -2000,13 +2008,14 @@ class TrainingDataGenerator:
     """
     image_path = self.image_paths[img_idx]
     mn_mask_path = self.mn_masks_paths[img_idx]
+    mn_like_mask_path = self.mn_like_masks_paths[img_idx]
     pn_mask_path = self.pn_masks_paths[img_idx]
 
     channels = TrainingDataGenerator.open_image(image_path)
     if self.use_dist_masks:
-      mask = self.get_dual_mask(mn_mask_path, pn_mask_path)
+      mask = self.get_dual_mask(mn_mask_path, pn_mask_path, mn_like_mask_path)
     else:
-      mask = self.get_combined_mask(mn_mask_path, pn_mask_path)
+      mask = self.get_combined_mask(mn_mask_path, pn_mask_path, mn_like_mask_path)
       if self.draw_border:
         mn_mask = mask[...,2].copy()
         mn_mask[mn_mask[...,0] != 2] = 0
@@ -2043,7 +2052,7 @@ class TrainingDataGenerator:
 
     datapoints = []
     if self.num_per_image is None:
-      num_per_image = (width//crop_size)*(height//crop_size)
+      num_per_image = (width//self.crop_size)*(height//self.crop_size)
     else:
       num_per_image = self.num_per_image
 
@@ -2181,7 +2190,7 @@ class TrainingDataGenerator:
     channels += edges
     return channels
 
-  def get_dual_mask(self, mn_mask_path, pn_mask_path):
+  def get_dual_mask(self, mn_mask_path, pn_mask_path, mn_like_mask_path=None):
     """
     Read nucleis and MN masks and combine into a single image
 
@@ -2198,11 +2207,20 @@ class TrainingDataGenerator:
     --------
     np.array
     """
-    mask = self.get_combined_mask(mn_mask_path, pn_mask_path)
+    mask = self.get_combined_mask(mn_mask_path, pn_mask_path, mn_like_mask_path)
+    n_channels = 3
+    if self.use_mn_like:
+      n_channels = 4
 
-    return np.stack([ mask[...,0], mask[...,1], mask[...,2], self.distance_masks[str(mn_mask_path)][...,0], self.distance_masks[str(mn_mask_path)][...,1]], axis=-1)
+    stack = []
+    for i in range(n_channels):
+      stack.append(mask[...,i])
+    stack.append(self.distance_masks[str(mn_mask_path)][...,0])
+    stack.append(self.distance_masks[str(mn_mask_path)][...,1])
 
-  def get_combined_mask(self, mn_mask_path, pn_mask_path):
+    return np.stack(stack, axis=-1)
+
+  def get_combined_mask(self, mn_mask_path, pn_mask_path, mn_like_mask_path=None):
     """
     Read nucleis and MN masks and combine into a single image
 
@@ -2229,6 +2247,15 @@ class TrainingDataGenerator:
     nuc_mask[(pn_details[...,0] > 0)] = 1 # Nucleus
     mn_mask[(mn_details[...,0] > 0)] = 1 # MN
     bg_mask[(pn_details[...,0] == 0) & (mn_details[...,0] == 0)] = 1
+
+    if self.use_mn_like and mn_like_mask_path is not None and mn_like_mask_path.exists():
+      mn_like_details = TrainingDataGenerator.open_mask(mn_like_mask_path)
+      mn_like_mask = np.zeros_like(nuc_mask)
+      mn_like_mask[(nuc_mask == 1) & (mn_like_details[...,2] > 0)] = 1
+
+      nuc_mask[mn_like_mask > 0] = 0
+
+      return np.stack([ bg_mask, nuc_mask, mn_mask, mn_like_mask ], axis=-1)
 
     return np.stack([ bg_mask, nuc_mask, mn_mask ], axis=-1)
 
