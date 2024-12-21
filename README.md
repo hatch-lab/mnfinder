@@ -3,8 +3,10 @@ A package for segmenting micronuclei in micrographs.
 
 ## Image information
 Raw images are in the "images" folders.
+
 Ground truth masks are in the "mn_masks" and "n_masks" folders associated with each data set.
-Image acquistion, cell type, and chromatin label information can be found in  image_info.csv in the test_images folder
+
+Image acquistion, cell type, and chromatin label information can be found in  image-info.csv in the test-data folder.
 
 ## Quick-start
 ````
