@@ -1,0 +1,4 @@
+﻿image,dataset,original_obj,scope,cell_type,dna_stain
+2198.tif,2022-05-26_RPE1,20,WF,RPE-1,H2B-emiRFP703
+1.tif,2022-10-14_U2OS,20,WF,U2OS,H2B-emiRFP703
+4.tif,2023-05-31_misc,40,SPE,HeLa,DAPI
