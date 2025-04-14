@@ -1,12 +1,4 @@
----
-title: "Emily's guide to running MNFinder for users new to python (like me) - MacOS"
-author: "Emily Hatch"
-date: "2025-04-11"
-output: 
-  html_document:
-    keep_md: TRUE
----
-
+# Emily's guide to using MNFinder for those new to python (like me)
 
 ## Input Images
 MNFinder is designed to work on single section (or single projection) fluorescent images of DNA in adherent cultured cells. Both single channel and multichannel images can be used as input. MNFinder has been run successfully on images with micronucleus (MN) frequencies as low as 1% MN positive cells and as high as 70%.
